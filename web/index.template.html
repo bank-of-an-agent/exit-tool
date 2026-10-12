@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Content-Security-Policy" content="__CSP__" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Agent Bank owner exit</title>
+    <style>
+      /*__STYLE__*/
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Agent Bank owner exit</h1>
+      <p class="muted">
+        Withdraw everything from your Agent Bank account with your owner wallet alone. This page has no server
+        and makes no network request of its own: it reads the chain and sends transactions only through your
+        wallet. Every owner action is a Safe transaction you sign (<code>execTransaction</code>), which no
+        Agent Bank module can block. Base Sepolia and local Anvil only; mainnet is refused.
+      </p>
+      <div id="status" class="status" role="status" aria-live="polite">Loading…</div>
+
+      <section>
+        <h2>1. Connect your owner wallet</h2>
+        <p id="wallet" class="muted">Not connected.</p>
+        <button id="connect" type="button">Connect wallet</button>
+        <button id="switch" type="button" class="secondary">Switch to Base Sepolia</button>
+      </section>
+
+      <section>
+        <h2>2. Inspect your account</h2>
+        <label for="account">Agent Bank account (Safe) address</label>
+        <input id="account" type="text" placeholder="0x…" autocomplete="off" spellcheck="false" />
+        <details>
+          <summary>Advanced: token and Agent Bank contract addresses</summary>
+          <label for="usdc">USDC address (filled in for Base Sepolia)</label>
+          <input id="usdc" type="text" placeholder="0x…" autocomplete="off" spellcheck="false" />
+          <label for="deployments"
+            >Agent Bank deployments JSON (to include escrows, streams and vaults)</label
+          >
+          <textarea
+            id="deployments"
+            spellcheck="false"
+            placeholder='{"chainId": 84532, "contracts": {"AgentEscrow": "0x…", "PaymentStreams": "0x…", "TimeLockVaults": "0x…"}}'
+          ></textarea>
+        </details>
+        <button id="inspect" type="button">Inspect</button>
+        <div id="report"></div>
+      </section>
+
+      <section id="actions" hidden>
+        <h2>3. Act</h2>
+        <label for="to">Destination (a wallet you control)</label>
+        <input id="to" type="text" placeholder="0x…" autocomplete="off" spellcheck="false" />
+        <h3>Exit everything</h3>
+        <p class="muted">
+          Removes every module (agent session keys, the bank's executors and hooks), resets the fallback
+          handler, removes any guard, brings escrows, streams, vaults and spend-key floats back into the
+          account, then sends every token and all ETH to the destination.
+        </p>
+        <button id="preview-exit" type="button">Preview exit</button>
+        <button id="preview-revoke" type="button" class="secondary">
+          Preview: only revoke agent and bank powers
+        </button>
+        <h3>Withdraw one asset</h3>
+        <div class="row">
+          <div>
+            <label for="token">Asset</label>
+            <select id="token">
+              <option value="usdc">USDC</option>
+              <option value="eth">ETH</option>
+              <option value="custom">Other ERC-20…</option>
+            </select>
+          </div>
+          <div>
+            <label for="amount">Amount</label>
+            <input id="amount" type="text" placeholder="e.g. 25.5" autocomplete="off" disabled />
+            <label class="inline"><input id="all" type="checkbox" checked /> everything</label>
+          </div>
+        </div>
+        <div id="custom-token-row" hidden>
+          <label for="custom-token">Token address</label>
+          <input id="custom-token" type="text" placeholder="0x…" autocomplete="off" spellcheck="false" />
+        </div>
+        <button id="preview-withdraw" type="button">Preview withdrawal</button>
+      </section>
+
+      <section>
+        <div id="plan">
+          <p class="muted">
+            Plans appear here. Nothing is signed or sent until you press the send button and approve each
+            request in your wallet.
+          </p>
+        </div>
+      </section>
+
+      <footer>
+        <p>
+          @agentbank/exit <span id="version"></span>. Open this file over http(s) (for example
+          <code>python3 -m http.server</code> in its folder): browser wallets do not inject into file://
+          pages. The command-line tool (<code>agentbank-exit</code>) does the same with an RPC URL and your
+          owner key or a hardware wallet.
+        </p>
+      </footer>
+    </main>
+    <script>
+      /*__SCRIPT__*/
+    </script>
+  </body>
+</html>

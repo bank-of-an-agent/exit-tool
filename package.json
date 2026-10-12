@@ -44,7 +44,7 @@
     "build": "tsup",
     "build:web": "node scripts/build-web.mjs",
     "check:web": "node scripts/build-web.mjs --check",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p web/tsconfig.json",
     "lint": "eslint . --max-warnings=0",
     "format": "prettier --write .",
     "format:check": "prettier --check .",

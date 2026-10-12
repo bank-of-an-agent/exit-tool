@@ -76,7 +76,7 @@ export const SAFE_ARTIFACTS = {
 
 /** Where Agent Bank Foundry artifacts are expected: $AGENTBANK_CONTRACTS_OUT or ../contracts/out. */
 export const CONTRACTS_OUT =
-  process.env.AGENTBANK_CONTRACTS_OUT ?? path.resolve(import.meta.dirname, "../../../contracts/out");
+  process.env.AGENTBANK_CONTRACTS_OUT || path.resolve(import.meta.dirname, "../../../contracts/out");
 
 export function agentBankArtifact(name: string): Artifact | undefined {
   const file = path.join(CONTRACTS_OUT, `${name}.sol`, `${name}.json`);

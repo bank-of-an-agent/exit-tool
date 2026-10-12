@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      require_contracts:
+        description: "Fail (instead of skipping) the Agent Bank parts of the drill when the contracts cannot be built"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Format, lint, typecheck, unit tests, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Format
+        run: pnpm format:check
+      - name: Lint
+        run: pnpm lint
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Unit tests
+        run: pnpm test
+      - name: Build
+        run: pnpm build
+      - name: Static web page is up to date
+        run: pnpm check:web
+      - name: CLI smoke test
+        run: |
+          node dist/cli.js --version
+          node dist/cli.js help > /dev/null
+
+  shutdown-drill:
+    name: Shutdown drill (Anvil)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.4
+      - run: pnpm install --frozen-lockfile
+      # The drill deploys the real Agent Bank contracts. They live in a separate repository; if it is
+      # private, give this workflow a fine-grained, read-only token for it in AGENTBANK_CONTRACTS_TOKEN.
+      - name: Check out the Agent Bank contracts
+        id: contracts
+        continue-on-error: true
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.AGENTBANK_CONTRACTS_REPO || 'bank-of-an-agent/contracts' }}
+          ref: ${{ vars.AGENTBANK_CONTRACTS_REF || 'main' }}
+          path: .agentbank-contracts
+          submodules: recursive
+          persist-credentials: false
+          token: ${{ secrets.AGENTBANK_CONTRACTS_TOKEN || github.token }}
+      - name: Build the Agent Bank contracts
+        id: build
+        if: steps.contracts.outcome == 'success'
+        continue-on-error: true
+        working-directory: .agentbank-contracts
+        run: forge build
+      - name: Warn when the drill runs without the Agent Bank contracts
+        if: steps.contracts.outcome != 'success' || steps.build.outcome != 'success'
+        run: echo "::warning::Agent Bank contracts unavailable; the escrow/stream/vault parts of the shutdown drill are skipped."
+      - name: Shutdown drill
+        env:
+          AGENTBANK_CONTRACTS_OUT: ${{ steps.build.outcome == 'success' && format('{0}/.agentbank-contracts/out', github.workspace) || '' }}
+          REQUIRE_AGENTBANK_CONTRACTS: ${{ inputs.require_contracts && '1' || '0' }}
+        run: pnpm test:integration
