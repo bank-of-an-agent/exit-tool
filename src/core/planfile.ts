@@ -8,7 +8,14 @@ import {
   type Address,
   type Hex,
 } from "viem";
-import { agentEscrowAbi, erc20Abi, paymentStreamsAbi, safeAbi, timeLockVaultsAbi } from "./abis/index";
+import {
+  agentEscrowAbi,
+  erc20Abi,
+  ownableValidatorAbi,
+  paymentStreamsAbi,
+  safeAbi,
+  timeLockVaultsAbi,
+} from "./abis/index";
 import type { AgentBankContracts } from "./deployments";
 import { ZERO_ADDRESS } from "./constants";
 import { ExitToolError } from "./errors";
@@ -151,7 +158,7 @@ function deserializeStep(raw: unknown): MaterializedStep {
     title: str(r.title, "step.title"),
     notes: Array.isArray(r.notes) ? r.notes.map(String) : [],
     via: r.via === "safe" ? "safe" : "direct",
-    category: (["revoke", "recover", "withdraw"].includes(String(r.category))
+    category: (["revoke", "recover", "withdraw", "configure"].includes(String(r.category))
       ? r.category
       : "recover") as MaterializedStep["category"],
     call: {
@@ -375,6 +382,13 @@ export interface TrustedPlanContext {
   compatibilityFallbackHandler: Address;
   /** Whether the canonical MultiSendCallOnly code was verified on this chain. */
   multiSendVerified: boolean;
+  /**
+   * OwnableValidators holding owners for the account (known deployments, or the one named with
+   * --validator): a plan may change their owners, but only towards the Safe's current ones.
+   */
+  ownerValidators?: readonly Address[];
+  /** The Safe's current owners and threshold, read from the chain. */
+  safe?: { owners: readonly Address[]; threshold: bigint };
 }
 
 function decodeKnown(data: Hex): { functionName: string; args: readonly unknown[] } | undefined {
@@ -403,6 +417,41 @@ function describeSelfCall(call: { data: Hex; value: bigint }, ctx: TrustedPlanCo
       : `set the fallback handler to the verified CompatibilityFallbackHandler ${handler}`;
   }
   return undefined;
+}
+
+/**
+ * An OwnableValidator owner change: only adding a current Safe owner, removing an address that is not
+ * a Safe owner, or setting the Safe's threshold (what `sync-owner` produces).
+ */
+function describeValidatorCall(
+  call: { to: Address; data: Hex; value: bigint },
+  ctx: TrustedPlanContext,
+): string | undefined {
+  const safe = ctx.safe;
+  if (call.value !== 0n || !safe) return undefined;
+  let d;
+  try {
+    d = decodeFunctionData({ abi: ownableValidatorAbi, data: call.data });
+  } catch {
+    return undefined;
+  }
+  const isSafeOwner = (a: Address): boolean => safe.owners.some((o) => isAddressEqual(o, a));
+  switch (d.functionName) {
+    case "addOwner":
+      return isSafeOwner(d.args[0])
+        ? `Add Safe owner ${d.args[0]} to the owners of validator ${call.to}`
+        : undefined;
+    case "removeOwner":
+      return isSafeOwner(d.args[1])
+        ? undefined
+        : `Remove ${d.args[1]} (not a Safe owner) from the owners of validator ${call.to}`;
+    case "setThreshold":
+      return d.args[0] === safe.threshold
+        ? `Set the threshold of validator ${call.to} to ${d.args[0]} (the Safe's)`
+        : undefined;
+    default:
+      return undefined;
+  }
 }
 
 /**
@@ -456,6 +505,12 @@ export function verifyPlanSteps(steps: MaterializedStep[], ctx: TrustedPlanConte
         continue;
       }
       if (call.value !== 0n) refuse(step, "it sends ETH along with a contract call");
+      if (ctx.ownerValidators?.some((v) => isAddressEqual(v, call.to))) {
+        const what = describeValidatorCall(call, ctx);
+        if (!what) refuse(step, "it changes the validator's owners other than towards the Safe's owners");
+        step.title = what!;
+        continue;
+      }
       const d = decodeKnown(call.data);
       if (d?.functionName === "transfer") {
         toDestination(step, d.args[0] as Address);
@@ -477,6 +532,12 @@ export function verifyPlanSteps(steps: MaterializedStep[], ctx: TrustedPlanConte
         }
         step.title = `Cancel stream #${String(d.args[0])} (the payee keeps what it earned; the rest returns to the account)`;
         continue;
+      }
+      if (describeValidatorCall(call, { ...ctx, ownerValidators: [call.to] })) {
+        refuse(
+          step,
+          `it changes the owners of ${call.to}, which is not an OwnableValidator known for this account (if it is yours, pass --validator ${call.to})`,
+        );
       }
       refuse(step, `unexpected Safe transaction to ${call.to}`);
     }

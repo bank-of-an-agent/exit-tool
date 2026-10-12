@@ -8,6 +8,7 @@ import {
   timeLockVaultsAbi,
   topUpExecutorAbi,
 } from "./generated/agentbank";
+import { ownableValidatorAbi } from "./ownableValidator";
 import { safeAbi } from "./safe";
 
 export { erc20Abi, multicall3Abi } from "./erc20";
@@ -20,6 +21,7 @@ export {
   timeLockVaultsAbi,
   topUpExecutorAbi,
 } from "./generated/agentbank";
+export { ownableValidatorAbi, safe7579ValidatorsAbi } from "./ownableValidator";
 export { SAFE_ERROR_CODES, safeAbi } from "./safe";
 
 /** Every custom error the tool may meet, de-duplicated by signature, for decoding revert data. */
@@ -35,6 +37,7 @@ export const knownErrorsAbi: Abi = (() => {
     ...topUpExecutorAbi,
     ...sweepExecutorAbi,
     ...agentPolicyHookAbi,
+    ...ownableValidatorAbi,
   ] as Abi;
   for (const item of all) {
     if (item.type !== "error") continue;

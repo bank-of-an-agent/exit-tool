@@ -88,6 +88,13 @@
           <input id="custom-token" type="text" placeholder="0x…" autocomplete="off" spellcheck="false" />
         </div>
         <button id="preview-withdraw" type="button">Preview withdrawal</button>
+        <h3>After a guardian recovery: sync the owner validator</h3>
+        <p class="muted">
+          Agent Bank owner operations are checked by an OwnableValidator with its own owner list. A guardian
+          recovery changes only the Safe's owners: this makes the validator list exactly the Safe's owners
+          again (the old key loses its access), signed by your new owner wallet. It moves no funds.
+        </p>
+        <button id="preview-sync-owner" type="button" class="secondary">Preview validator owner sync</button>
       </section>
 
       <section>

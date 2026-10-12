@@ -36,7 +36,10 @@ Phase 5 gate.
   uses it only after checking that contract's runtime code hash on the chain. MultiSendCallOnly can
   only make CALLs, and here it only calls `disableModule` and `setFallbackHandler` on the account
   itself. Plan files that break any of these rules are rejected. Public steps in a plan file may only
-  call the refund, settle and withdraw functions, with no value.
+  call the refund, settle and withdraw functions, with no value. A plan file may call an
+  OwnableValidator (one recognised by address and code hash, or named with `--validator` on
+  `submit`) only to add a current Safe owner, remove an address that is not a Safe owner, or set the
+  Safe's threshold; the Safe's owners are read from the chain, never from the file.
 - **Dry run by default.** Plans are simulated in full (one `eth_simulateV1` block) before anything is
   signed. Dry runs stand in for owner signatures with a simulation-only ERC-1271 stub installed by a
   state override; it never reaches the chain. Execution re-checks every step with `eth_call` right
@@ -55,7 +58,13 @@ Phase 5 gate.
   too. While it stays enabled, a threshold of the guardians can replace the owners after the delay.
   `inspect` reports the guardians, the threshold and any pending recovery, which the owner can cancel
   with `cancelRecovery()`.
-
+- **Owner validator after a recovery.** A guardian recovery replaces the Safe's owners only. Until
+  `sync-owner` runs (or `exit` / `disable-modules` disables the Safe7579 adapter), the old key can
+  still authorize ERC-4337 operations through the OwnableValidator, and `inspect` reports this as a
+  danger. `sync-owner` only knows Rhinestone's OwnableValidator deployments (module release V1 and
+  beta) unless given `--validator`. It changes who can sign owner operations, nothing else: agent
+  session keys (Smart Sessions), executors and hooks on the adapter, including any enabled before
+  the recovery, stay until they are removed or the adapter is disabled.
 - **Guards.** A Safe transaction guard can veto any owner transaction, including the one removing it.
   Agent Bank does not install guards; the tool removes any guard first and the simulation shows
   whether the guard allows it.

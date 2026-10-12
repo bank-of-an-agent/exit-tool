@@ -10,6 +10,7 @@ export const COMMANDS = [
   "cancel-streams",
   "withdraw-vaults",
   "sweep-spend-keys",
+  "sync-owner",
   "exit",
   "submit",
   "help",
@@ -53,6 +54,7 @@ const OPTIONS = {
   "unlocked-only": { type: "boolean" },
   "skip-spend-keys": { type: "boolean" },
   "extra-token": { type: "string", multiple: true },
+  validator: { type: "string" },
   help: { type: "boolean", short: "h" },
   version: { type: "boolean", short: "v" },
 } as const;
@@ -91,13 +93,14 @@ const SIGNING: OptionName[] = [
 ];
 
 const PER_COMMAND: Record<Command, OptionName[]> = {
-  inspect: ["keystore", "signer"],
+  inspect: ["keystore", "signer", "validator"],
   withdraw: [...SIGNING, "to", "token", "amount"],
   "disable-modules": [...SIGNING, "keep-guard", "include-recovery"],
   "refund-escrows": [...SIGNING, "ids"],
   "cancel-streams": [...SIGNING, "ids"],
   "withdraw-vaults": [...SIGNING, "ids", "unlocked-only"],
   "sweep-spend-keys": [...SIGNING],
+  "sync-owner": [...SIGNING, "validator"],
   exit: [
     ...SIGNING,
     "to",
@@ -106,8 +109,9 @@ const PER_COMMAND: Record<Command, OptionName[]> = {
     "unlocked-only",
     "skip-spend-keys",
     "extra-token",
+    "validator",
   ],
-  submit: [...SIGNING, "to"],
+  submit: [...SIGNING, "to", "validator"],
   help: [],
 };
 
@@ -223,9 +227,15 @@ Commands
   withdraw-vaults    Return time-lock vaults to the account; locked ones with your owner's
                      EIP-712 signature [--ids …] [--unlocked-only]
   sweep-spend-keys   Pull agent spend-key floats back with their permit allowance [--spend-key …]
+  sync-owner         After a guardian recovery: make the OwnableValidator (owner ERC-4337
+                     operations) list exactly the Safe's owners, with the Safe's threshold:
+                     addOwner(new), then removeOwner(prev, old), as Safe transactions signed by
+                     the current Safe owner(s). Moves no funds. [--validator <address>]
   exit               All of the above in a safe order, then withdraw every token and all ETH:
                        --to <address> [--keep-guard] [--include-recovery] [--unlocked-only]
                        [--skip-spend-keys] [--extra-token <erc20>]…
+                     A validator whose owners differ from the Safe's is reported, not changed:
+                     the exit disables the Safe7579 adapter, which makes it unreachable.
   submit             Execute a --signer-only plan file with its signatures:
                        --plan-file <file> --signature <hex>… [--to <your address>] [--execute]
                      Every step is checked against what this tool produces; a plan that moves
@@ -240,6 +250,8 @@ Connection
   --discovery auto|events|enumerate   How escrows/streams/vaults are found (default auto)
   --max-log-requests <n>     eth_getLogs budget before falling back to enumeration (default 500)
   --spend-key <address>      Agent spend key to sweep (repeatable; others are found from events)
+  --validator <address>      OwnableValidator to compare with the Safe's owners (default: the known
+                             Rhinestone deployments that hold owners for the account)
   --json                     Machine-readable output on stdout
 
 Keys and execution (dry run by default: nothing is signed or sent)

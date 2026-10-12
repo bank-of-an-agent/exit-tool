@@ -151,24 +151,35 @@ An opt-in suite, `RUN_FORK_TESTS=1 pnpm test:integration test/integration/base-s
 (or the `base-sepolia-fork` CI job), runs the tool against a local Anvil fork of Base Sepolia at
 block 48,000,000. Nothing is sent to Base Sepolia itself. On the fork it meets the real deployed
 contracts: Safe v1.4.1, the Safe7579 adapter, the canonical MultiSendCallOnly, Circle's FiatToken
-USDC (minted through the master-minter path), and Candide's SocialRecoveryModule (72 h) with 3
-guardians, threshold 2 and a pending recovery started by two guardians.
+USDC (minted through the master-minter path), Candide's SocialRecoveryModule (72 h) and Rhinestone's
+OwnableValidator (module release V1).
 
-The suite passed on 2026-10-11 (2 tests, about 15 s):
+The suite passed on 2026-10-11 (3 tests, about 25 s):
 
-- `inspect` recognised the recovery module by address and code hash, and listed its guardians,
+- On an account with 3 guardians, threshold 2 and a pending recovery started by two of them,
+  `inspect` recognised the recovery module by address and code hash, and listed its guardians,
   threshold and pending recovery.
 - `disable-modules` removed the adapter and the bank module in one batch and kept the recovery
-  module.
-- `exit` moved 500 USDC and 1 ETH to the destination.
-- `--include-recovery` then removed the recovery module.
+  module. `exit` moved 500 USDC and 1 ETH to the destination. `--include-recovery` then removed the
+  recovery module.
+- `sync-owner`, on a second account set up like an Agent Bank one: the adapter lists the
+  OwnableValidator with owners `[owner]`, threshold 1. Two guardians recovered the account to a new
+  key and, 72 hours later, the recovery was finalized. An ERC-4337 owner operation, validated the way
+  the EntryPoint does it (through the account, the adapter and the validator), still accepted the
+  lost key and refused the new one. `inspect` reported "validator owners differ from Safe owners" as
+  a danger, and `exit` listed it as an informational item. The lost key could not run `sync-owner`.
+  A `--signer-only` plan signed by the new key passed `submit`'s checks and simulation.
+  `sync-owner --execute` then sent `addOwner(new)` and `removeOwner(new, old)`. Afterwards the
+  validator listed only the new key, the same operation was accepted for the new key and refused for
+  the lost one, and `sync-owner` had nothing left to do.
 
 ## What the drill does not cover
 
-- **The Safe7579 adapter's own bytecode** is not executed. Its address is registered as a module
-  and fallback handler, as on Base Sepolia, and an EOA module stands in for the execution powers
-  the adapter gives sessions and executors. The exit path never calls the adapter: it uses
-  `execTransaction` and disables the adapter.
+- **The Safe7579 adapter's own bytecode** is not executed in the drill. Its address is registered as
+  a module and fallback handler, as on Base Sepolia, and an EOA module stands in for the execution
+  powers the adapter gives sessions and executors. The exit path never calls the adapter: it uses
+  `execTransaction` and disables the adapter. The Base Sepolia fork check runs the real adapter and
+  OwnableValidator for ERC-4337 validation, but not agent sessions or executors.
 - **Base Sepolia itself.** Agent Bank's contracts are not deployed there yet; the contracts repo
   only has dry-run CREATE2 predictions. Run the tool read-only against Base Sepolia once
   `deployments/84532.json` exists. The tool has been run read-only (`inspect` and a dry-run `exit`)

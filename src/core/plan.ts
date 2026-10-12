@@ -6,6 +6,12 @@ import { formatTimestamp } from "./describe";
 import { ExitToolError } from "./errors";
 import type { AccountReport } from "./inspect";
 import type { Call } from "./safe";
+import {
+  encodeValidatorCall,
+  syncOwnerCalls,
+  type OwnerValidatorState,
+  type ValidatorCall,
+} from "./validator";
 
 export type CommandName =
   | "withdraw"
@@ -14,6 +20,7 @@ export type CommandName =
   | "cancel-streams"
   | "withdraw-vaults"
   | "sweep-spend-keys"
+  | "sync-owner"
   | "exit";
 
 /**
@@ -47,7 +54,8 @@ export interface PlanStep {
    * `direct`: a plain transaction that anyone may send (the contract only ever pays the account).
    */
   via: "safe" | "direct";
-  category: "revoke" | "recover" | "withdraw";
+  /** `configure`: account settings that move no funds (the validator owner sync). */
+  category: "revoke" | "recover" | "withdraw" | "configure";
   /** Safe steps only: 0 = CALL (default); 1 = DELEGATECALL, used only for the canonical MultiSendCallOnly batch. */
   operation?: 0 | 1;
   amount: AmountSource;
@@ -67,6 +75,8 @@ export interface Plan {
   steps: PlanStep[];
   /** Positions the plan leaves alone, with the reason. */
   skipped: string[];
+  /** Informational items: things the owner should know that the plan deliberately does not do. */
+  info?: string[];
 }
 
 const call = (to: Address, data: Hex, value = 0n): Call => ({ to: getAddress(to), data, value });
@@ -212,6 +222,7 @@ export function assertDestination(report: AccountReport, to: Address): Address {
   const forbidden = [
     SAFE7579_ADAPTER,
     ...report.safe.modules,
+    ...(report.ownerValidators ?? []).map((v) => v.validator),
     ...Object.values(report.contracts).filter((a): a is Address => Boolean(a)),
     ...Object.values(report.tokens).map((t) => t.address),
   ];
@@ -534,6 +545,92 @@ export function planSweepSpendKeys(report: AccountReport): { steps: PlanStep[]; 
 }
 
 // ---------------------------------------------------------------------------------------------
+// Validator owner sync (after a guardian recovery)
+// ---------------------------------------------------------------------------------------------
+
+function validatorCallStep(v: OwnerValidatorState, c: ValidatorCall): PlanStep {
+  const name = `OwnableValidator ${v.validator}`;
+  const base = {
+    via: "safe" as const,
+    category: "configure" as const,
+    amount: { kind: "none" as const },
+    build: () => call(v.validator, encodeValidatorCall(c)),
+  };
+  switch (c.fn) {
+    case "addOwner":
+      return {
+        ...base,
+        id: `validator-add-owner:${v.validator}:${c.owner}`,
+        title: `Add Safe owner ${c.owner} to the validator's owners`,
+        notes: [
+          `${name}.addOwner(${c.owner}), called by the account itself: the validator keeps its owners per account (msg.sender).`,
+        ],
+      };
+    case "setThreshold":
+      return {
+        ...base,
+        id: `validator-set-threshold:${v.validator}:${c.threshold}`,
+        title: `Set the validator's threshold to ${c.threshold} (the Safe's threshold; was ${c.previous})`,
+        notes: [`${name}.setThreshold(${c.threshold})`],
+      };
+    case "removeOwner":
+      return {
+        ...base,
+        id: `validator-remove-owner:${v.validator}:${c.owner}`,
+        title: `Remove ${c.owner} (not a Safe owner) from the validator's owners`,
+        notes: [
+          `${name}.removeOwner(prev = ${isAddressEqual(c.prev, SENTINEL) ? "SENTINEL" : c.prev}, owner = ${c.owner}); the additions come first, so the validator never has fewer owners than its threshold.`,
+        ],
+      };
+  }
+}
+
+/**
+ * Makes every OwnableValidator of the account list exactly the Safe's owners, with the Safe's
+ * threshold, through Safe transactions signed by the current Safe owner(s). For use after a guardian
+ * recovery replaced the Safe's owners: until then the old key can still authorize ERC-4337 operations
+ * through the Safe7579 adapter, and the new owner cannot. Moves no funds.
+ */
+export function planSyncOwner(report: AccountReport): {
+  steps: PlanStep[];
+  skipped: string[];
+  info: string[];
+} {
+  const steps: PlanStep[] = [];
+  const skipped: string[] = [];
+  for (const v of report.ownerValidators ?? []) {
+    if (v.inSync) {
+      skipped.push(
+        `${v.label} ${v.validator}: its owners already equal the Safe's owners (threshold ${v.threshold})`,
+      );
+      continue;
+    }
+    for (const c of syncOwnerCalls(v)) steps.push(validatorCallStep(v, c));
+  }
+  const info =
+    steps.length > 0
+      ? [
+          "sync-owner changes only who can sign owner operations. Agent session keys (Smart Sessions), executors and hooks on the Safe7579 adapter stay as they are, including any enabled before the recovery: review them, or run exit or disable-modules to revoke every agent and bank power.",
+        ]
+      : [];
+  return { steps, skipped, info };
+}
+
+/**
+ * The informational note of plans that disable the Safe7579 adapter (exit, disable-modules) about
+ * validators whose owners differ from the Safe's: the plan leaves them alone on purpose.
+ */
+export function ownerValidatorInfo(report: AccountReport): string[] {
+  const adapterEnabled = report.safe.modules.some((m) => isAddressEqual(m, SAFE7579_ADAPTER));
+  return (report.ownerValidators ?? [])
+    .filter((v) => !v.inSync)
+    .map(
+      (v) =>
+        `Validator owners differ from Safe owners: the ${v.label} ${v.validator} lists [${v.owners.join(", ")}] (threshold ${v.threshold}), the Safe [${report.safe.owners.join(", ")}] (threshold ${report.safe.threshold}). This plan does not change it: ${adapterEnabled ? "it disables the Safe7579 adapter, after which" : "the Safe7579 adapter is not enabled, so"} the validator cannot authorize anything for this account. To keep using the account with Agent Bank instead, run \`agentbank-exit sync-owner --account ${report.account}\`.`,
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // Full exit
 // ---------------------------------------------------------------------------------------------
 
@@ -603,5 +700,6 @@ export function planExit(report: AccountReport, options: ExitOptions): Plan {
     destination: to,
     steps,
     skipped,
+    info: ownerValidatorInfo(report),
   };
 }

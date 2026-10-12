@@ -130,6 +130,9 @@ describe("argument parsing", () => {
     expect(() => parseCliArgs(["inspect", "--to", "0x1"])).toThrow(/not an option of "inspect"/);
     expect(() => parseCliArgs(["withdraw", "--bogus"])).toThrow();
     expect(() => parseCliArgs(["frobnicate"])).toThrow(/Unknown command/);
+    expect(parseCliArgs(["sync-owner", "--validator", "0x1", "--signer-only"]).command).toBe("sync-owner");
+    expect(() => parseCliArgs(["sync-owner", "--to", "0x1"])).toThrow(/not an option of "sync-owner"/);
+    expect(() => parseCliArgs(["withdraw", "--validator", "0x1"])).toThrow(/not an option of "withdraw"/);
     expect(
       parseCliArgs(["exit", "--extra-token", "0x1", "--extra-token", "0x2"]).values["extra-token"],
     ).toEqual(["0x1", "0x2"]);

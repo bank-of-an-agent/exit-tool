@@ -1,5 +1,12 @@
 import { decodeFunctionData, formatEther, type Abi, type Address, type Hex } from "viem";
-import { agentEscrowAbi, erc20Abi, paymentStreamsAbi, safeAbi, timeLockVaultsAbi } from "./abis/index";
+import {
+  agentEscrowAbi,
+  erc20Abi,
+  ownableValidatorAbi,
+  paymentStreamsAbi,
+  safeAbi,
+  timeLockVaultsAbi,
+} from "./abis/index";
 import { decodeMultiSend, MULTISEND_CALL_ONLY } from "./multisend";
 import type { Call } from "./safe";
 
@@ -9,6 +16,7 @@ const CALL_ABI = [
   ...agentEscrowAbi,
   ...paymentStreamsAbi,
   ...timeLockVaultsAbi,
+  ...ownableValidatorAbi,
 ] as Abi;
 
 function formatArg(value: unknown): string {

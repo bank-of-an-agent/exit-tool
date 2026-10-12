@@ -25,6 +25,13 @@ All notable changes to `@agentbank/exit` are documented here. The format follows
   unless `--include-recovery` is passed, and compute each `disableModule` `prev` pointer around it.
 - Agent spend-key floats (contracts ADR 0001) with a live allowance to the account are shown by
   `inspect` and pulled back by `exit` (`transferFrom`) before the final withdrawal.
+- `sync-owner`: after a guardian recovery, makes Rhinestone's OwnableValidator (which validates the
+  owner's ERC-4337 operations) list exactly the Safe's owners with the Safe's threshold, as Safe
+  transactions signed by the current owner(s): `addOwner(new)`, `setThreshold` if needed, then
+  `removeOwner(prev, old)`. The validator is found among the known deployments by address and code
+  hash, or named with `--validator`. `inspect` reports "validator owners differ from Safe owners" (a
+  danger while the Safe7579 adapter can still accept the old key), and `exit` and `disable-modules`
+  list it as an informational note.
 - `inspect` reports the Safe configuration, Agent Bank executors and hook (TopUpExecutor,
   SweepExecutor, AgentPolicyHook), treasury-fund shares, and a plain-language split between what can
   be recovered now and what becomes recoverable later (with dates).

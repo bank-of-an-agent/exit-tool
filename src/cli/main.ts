@@ -36,8 +36,10 @@ import {
   planCancelStreams,
   planExit,
   planRefundEscrows,
+  ownerValidatorInfo,
   planRevoke,
   planSweepSpendKeys,
+  planSyncOwner,
   planWithdrawStep,
   planWithdrawVaults,
   type CommandName,
@@ -173,6 +175,7 @@ async function inspect(
     throw new ExitToolError("invalid_argument", "--discovery must be auto, events or enumerate.");
   }
   const maxLogRequests = Number(parseBigintOption("max-log-requests", values["max-log-requests"]) ?? 500n);
+  const validator = parseAddressOption("validator", values.validator);
   return inspectAccount(conn.client, {
     chain: conn.chain,
     account,
@@ -181,6 +184,7 @@ async function inspect(
     contracts: deployments.contracts,
     ...(deployments.fromBlock !== undefined ? { fromBlock: deployments.fromBlock } : {}),
     ...(signer ? { signer } : {}),
+    ...(validator ? { validator } : {}),
     spendKeys,
     positions,
     discovery: { mode: mode as "auto" | "events" | "enumerate", maxLogRequests },
@@ -214,7 +218,7 @@ async function runCommand(command: Exclude<Command, "submit" | "help">, ctx: Con
         ...(values["password-file"] ? { passwordFile: values["password-file"] } : {}),
       });
   let signer = await signerAddressFor(ctx, keySource);
-  const needsPositions = command !== "withdraw" && command !== "disable-modules";
+  const needsPositions = command !== "withdraw" && command !== "disable-modules" && command !== "sync-owner";
   const report = await inspect(ctx, account, signer, command === "inspect" || needsPositions);
   const summary = summarizeRecovery(report);
 
@@ -226,6 +230,11 @@ async function runCommand(command: Exclude<Command, "submit" | "help">, ctx: Con
         `Next: agentbank-exit exit --account ${account} --to <your address> [same connection options]`,
       );
       printer.line("      That is a dry run: it prints and simulates every step. Add --execute to send.");
+      if ((report.ownerValidators ?? []).some((v) => !v.inSync)) {
+        printer.line(
+          `To keep using Agent Bank after a guardian recovery instead: agentbank-exit sync-owner --account ${account} [same connection options]`,
+        );
+      }
     }
     printer.document({ command, report, recovery: summary });
     return 0;
@@ -264,12 +273,19 @@ async function runCommand(command: Exclude<Command, "submit" | "help">, ctx: Con
     }
   }
 
+  const info = plan.info ?? [];
+  const printInfo = (): void => {
+    if (info.length === 0) return;
+    printer.line("Informational (not part of this plan):");
+    for (const i of info) printer.line(`  - ${i}`);
+  };
   if (plan.steps.length === 0) {
     printer.line("Nothing to do.");
     for (const s of plan.skipped) printer.line(`  - ${s}`);
+    printInfo();
     printer.document({
       command,
-      plan: { steps: [], skipped: plan.skipped },
+      plan: { steps: [], skipped: plan.skipped, info },
       simulation: null,
       execution: null,
     });
@@ -316,13 +332,14 @@ async function runCommand(command: Exclude<Command, "submit" | "help">, ctx: Con
     printer.line("Left alone:");
     for (const s of plan.skipped) printer.line(`  - ${s}`);
   }
+  printInfo();
 
   const baseDoc = {
     command,
     chain: { id: conn.chain.id, name: conn.chain.name },
     account,
     destination: plan.destination ?? null,
-    plan: { steps: sim.steps, skipped: plan.skipped },
+    plan: { steps: sim.steps, skipped: plan.skipped, info },
     simulation: {
       ok: sim.ok,
       method: sim.method,
@@ -352,6 +369,7 @@ async function runCommand(command: Exclude<Command, "submit" | "help">, ctx: Con
       block: report.block.number,
       notes: [
         ...plan.skipped.map((s) => `left alone: ${s}`),
+        ...info.map((i) => `info: ${i}`),
         ...(deferred.length > 0
           ? ["After these steps are confirmed, sign the final withdrawals with:", ...deferred]
           : []),
@@ -474,7 +492,12 @@ async function buildPlan(
         keepGuard: values["keep-guard"] === true,
         includeRecovery: values["include-recovery"] === true,
       };
-      return { ...base, steps: planRevoke(report, options), skipped: recoveryKeptNote(report, options) };
+      return {
+        ...base,
+        steps: planRevoke(report, options),
+        skipped: recoveryKeptNote(report, options),
+        info: ownerValidatorInfo(report),
+      };
     }
     case "refund-escrows": {
       requireAgentBank(report, "escrow");
@@ -499,6 +522,23 @@ async function buildPlan(
       const r = planSweepSpendKeys(report);
       if (report.spendKeys.length === 0) r.skipped.push("no spend keys found: pass --spend-key <address>");
       return { ...base, ...r };
+    }
+    case "sync-owner": {
+      if ((report.ownerValidators ?? []).length === 0) {
+        const named = parseAddressOption("validator", values.validator);
+        throw new ExitToolError(
+          "missing_config",
+          named
+            ? `The validator ${named} holds no owners for ${report.account} (not initialized for it): there is nothing to sync.`
+            : `No known OwnableValidator holds owners for ${report.account} on ${report.chain.label}: there is nothing to sync.`,
+          named
+            ? {}
+            : {
+                hint: "If the account uses another OwnableValidator deployment, pass --validator <address>.",
+              },
+        );
+      }
+      return { ...base, ...planSyncOwner(report) };
     }
     case "exit": {
       const to = requireDestination(values, report);
@@ -645,13 +685,24 @@ async function finalState(ctx: Context, account: Address, signer: Address | unde
   ctx.printer.line(
     `  modules: ${report.safe.modules.length === 0 ? "none" : report.safe.modules.join(", ")}; fallback handler ${report.safe.fallbackHandler}; guard ${report.safe.guard}`,
   );
+  for (const v of report.ownerValidators ?? []) {
+    ctx.printer.line(
+      `  validator ${v.validator}: owners ${v.threshold} of [${v.owners.join(", ")}]${v.inSync ? ", equal to the Safe's" : " (DIFFERS from the Safe's owners)"}`,
+    );
+  }
   if (summary.pending.length > 0) {
     ctx.printer.line("  still pending:");
     for (const p of summary.pending) {
       ctx.printer.line(`    - ${tokenAmount(report, p.token, p.amount)}: ${p.label}`);
     }
   }
-  return { safe: report.safe, eth: report.eth, balances: report.balances, recovery: summary };
+  return {
+    safe: report.safe,
+    eth: report.eth,
+    balances: report.balances,
+    recovery: summary,
+    ownerValidators: report.ownerValidators ?? [],
+  };
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -864,6 +915,8 @@ async function runSubmit(ctx: Context): Promise<number> {
     contracts: reportStub.contracts,
     compatibilityFallbackHandler: reportStub.compatibilityFallbackHandler,
     multiSendVerified: Boolean(reportStub.multiSendCallOnly),
+    ownerValidators: (reportStub.ownerValidators ?? []).map((v) => v.validator),
+    safe: { owners: reportStub.safe.owners, threshold: reportStub.safe.threshold },
   });
 
   // Safe steps whose nonce is used are skipped only if the Safe executed exactly this SafeTx.

@@ -33,6 +33,7 @@ import {
 } from "./positions";
 import { readRecoveryState, type RecoveryState } from "./recovery";
 import { readSafeState, type SafeState } from "./safe";
+import { readOwnerValidators, type OwnerValidatorState } from "./validator";
 
 export interface InspectOptions {
   chain: ChainConfig;
@@ -48,6 +49,8 @@ export interface InspectOptions {
   signer?: Address;
   /** Spend keys given explicitly (`--spend-key`). */
   spendKeys?: readonly Address[];
+  /** The OwnableValidator to compare with the Safe's owners (`--validator`); known ones otherwise. */
+  validator?: Address;
   /** Skip escrow/stream/vault/spend-key discovery (commands that only touch the Safe itself). */
   positions?: boolean;
   discovery?: { mode?: "auto" | "events" | "enumerate"; maxLogRequests?: number };
@@ -101,6 +104,11 @@ export interface AccountReport {
   fundShares?: { fund: TokenInfo; balance: bigint };
   /** Guardian recovery (Candide SocialRecoveryModule), when enabled. Kept unless --include-recovery. */
   recovery?: RecoveryState;
+  /**
+   * The OwnableValidator(s) holding owners for the account (owner ERC-4337 operations), compared with
+   * the Safe's owners. `sync-owner` makes them equal after a guardian recovery.
+   */
+  ownerValidators?: OwnerValidatorState[];
 }
 
 const KNOWN_SINGLETONS: Record<string, string> = {
@@ -288,6 +296,15 @@ export async function inspectAccount(client: PublicClient, options: InspectOptio
     report.findings.push(
       ...safeFindings(safe, labels, report.compatibilityFallbackHandler, signer, recovery, block.timestamp),
     );
+    const validators = await readOwnerValidators(client, account, safe, {
+      ...(options.validator ? { validator: options.validator } : {}),
+      blockNumber: block.number,
+    });
+    if (validators.length > 0) {
+      report.ownerValidators = validators;
+      for (const v of validators) labels[v.validator.toLowerCase()] = v.label;
+      report.findings.push(...validatorFindings(validators, safe, account));
+    }
     if (isAddressEqual(report.compatibilityFallbackHandler, ZERO_ADDRESS)) {
       report.findings.push({
         severity: "warning",
@@ -407,6 +424,52 @@ export async function inspectAccount(client: PublicClient, options: InspectOptio
     });
   }
   return report;
+}
+
+/**
+ * "Validator owners differ from Safe owners": after a guardian recovery the OwnableValidator still
+ * lists the old key. While the Safe7579 adapter is enabled, that key can still authorize ERC-4337
+ * operations for the account (danger), and the new owner cannot use Agent Bank owner operations.
+ */
+export function validatorFindings(
+  validators: readonly OwnerValidatorState[],
+  safe: Pick<SafeState, "owners" | "threshold" | "modules" | "fallbackHandler">,
+  account: Address,
+): Finding[] {
+  const out: Finding[] = [];
+  // ERC-4337 operations reach the validator only through the adapter as fallback handler AND module.
+  const moduleEnabled = safe.modules.some((m) => isAddressEqual(m, SAFE7579_ADAPTER));
+  const isHandler = isAddressEqual(safe.fallbackHandler, SAFE7579_ADAPTER);
+  for (const v of validators) {
+    if (v.inSync) continue;
+    const reachable = moduleEnabled && isHandler && v.installed !== false;
+    const parts = [
+      `Validator owners differ from Safe owners: the ${v.label} ${v.validator}, which authorizes the owner's ERC-4337 operations, lists [${v.owners.join(", ")}] (threshold ${v.threshold}); the Safe's owners are [${safe.owners.join(", ")}] (threshold ${safe.threshold}).`,
+    ];
+    if (v.stale.length > 0) {
+      parts.push(
+        reachable
+          ? `${v.stale.join(", ")} ${v.stale.length === 1 ? "is not a Safe owner but can" : "are not Safe owners but can"} still authorize operations for this account through the Safe7579 adapter.`
+          : `${v.stale.join(", ")} ${v.stale.length === 1 ? "is not a Safe owner" : "are not Safe owners"}.`,
+      );
+    }
+    if (v.missing.length > 0) {
+      parts.push(
+        `${v.missing.join(", ")} cannot sign Agent Bank owner operations until the validator is synced.`,
+      );
+    }
+    parts.push(
+      reachable
+        ? `Run \`agentbank-exit sync-owner --account ${account}\` (signed by the Safe's owners) to make them equal, or exit, which disables the adapter.`
+        : `The Safe7579 adapter ${!moduleEnabled ? "is not enabled" : !isHandler ? "is not the fallback handler" : "does not list this validator"}, so the validator cannot authorize anything now; run sync-owner before enabling the adapter again.`,
+    );
+    out.push({
+      severity: reachable ? (v.stale.length > 0 ? "danger" : "warning") : "info",
+      code: "validator_owners_differ",
+      message: parts.join(" "),
+    });
+  }
+  return out;
 }
 
 /** What the owner should know about guardian recovery (contracts ADR 0002). */

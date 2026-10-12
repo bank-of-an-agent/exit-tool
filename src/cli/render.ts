@@ -62,6 +62,18 @@ export function renderReport(report: AccountReport, summary: RecoverySummary, ch
           : "            no recovery pending",
       );
     }
+    for (const v of report.ownerValidators ?? []) {
+      const where =
+        v.installed === true
+          ? ", installed on the Safe7579 adapter"
+          : v.installed === false
+            ? ", not installed on the Safe7579 adapter"
+            : "";
+      out.push(`Validator   ${v.validator} (${v.label}${where})`);
+      out.push(
+        `            owners ${v.threshold} of ${v.owners.length}: ${v.owners.join(", ")}${v.inSync ? " (the Safe's owners)" : " DIFFER from the Safe's owners: see Findings"}`,
+      );
+    }
   }
   if (report.signer && !report.signer.isOwner)
     out.push(`Your key    ${report.signer.address} is NOT an owner`);

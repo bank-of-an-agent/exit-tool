@@ -27,7 +27,15 @@ import { describeCall, formatTimestamp } from "../../src/core/describe";
 import { ExitToolError } from "../../src/core/errors";
 import { executePlan, type ExecutedStep, type ProgressEvent } from "../../src/core/execute";
 import { inspectAccount, type AccountReport } from "../../src/core/inspect";
-import { assertDestination, planExit, planRevoke, planWithdrawStep, type Plan } from "../../src/core/plan";
+import {
+  assertDestination,
+  ownerValidatorInfo,
+  planExit,
+  planRevoke,
+  planSyncOwner,
+  planWithdrawStep,
+  type Plan,
+} from "../../src/core/plan";
 import { readTokenInfo } from "../../src/core/positions";
 import { describeError } from "../../src/core/revert";
 import {
@@ -290,6 +298,15 @@ function renderReport(report: AccountReport): void {
         }`
       : "not enabled",
   );
+  for (const v of report.ownerValidators ?? []) {
+    row(
+      t,
+      "Owner validator",
+      `${v.validator} (${v.label}): ${v.threshold} of ${v.owners.join(", ")}${
+        v.inSync ? " (the Safe's owners)" : ": DIFFERS from the Safe's owners (see Findings)"
+      }`,
+    );
+  }
   const balances = [
     `${formatEther(report.eth)} ETH`,
     ...Object.entries(report.tokens).map(
@@ -340,7 +357,7 @@ function renderReport(report: AccountReport): void {
 // Plan, simulate, execute
 // ----------------------------------------------------------------------------------------------
 
-async function preview(kind: "withdraw" | "exit" | "revoke"): Promise<void> {
+async function preview(kind: "withdraw" | "exit" | "revoke" | "sync-owner"): Promise<void> {
   const report = state.report;
   const client = state.client;
   if (!report || !client) throw new ExitToolError("invalid_argument", "Inspect the account first.");
@@ -353,6 +370,17 @@ async function preview(kind: "withdraw" | "exit" | "revoke"): Promise<void> {
       account: report.account,
       steps: planRevoke(report, { includeRecovery }),
       skipped: [],
+      info: ownerValidatorInfo(report),
+    };
+  } else if (kind === "sync-owner") {
+    if ((report.ownerValidators ?? []).length === 0) {
+      throw new ExitToolError("missing_config", "No known OwnableValidator holds owners for this account.");
+    }
+    plan = {
+      command: "sync-owner",
+      chainId: report.chain.id,
+      account: report.account,
+      ...planSyncOwner(report),
     };
   } else {
     const to = assertDestination(report, addressField("to", "Destination"));
@@ -391,7 +419,7 @@ async function preview(kind: "withdraw" | "exit" | "revoke"): Promise<void> {
   }
   if (plan.steps.length === 0) {
     clear($("plan"));
-    status("Nothing to do.", "ok");
+    status(`Nothing to do.${plan.skipped.length > 0 ? ` ${plan.skipped.join("; ")}.` : ""}`, "ok");
     return;
   }
   const sim = await materializeAndSimulate(client, report, plan, {
@@ -460,6 +488,7 @@ function renderPlan(report: AccountReport, plan: Plan, sim: SimulationResult): v
       el("p", `Simulated result: the destination receives ${gains.length ? gains.join(", ") : "nothing"}.`),
     );
   }
+  for (const info of plan.info ?? []) box.append(el("p", `Note (not part of this plan): ${info}`, "muted"));
   const pending = summarizeRecovery(report).pending;
   if (plan.command === "exit" && pending.length > 0) {
     box.append(
@@ -569,6 +598,10 @@ function init(): void {
   $("preview-revoke").addEventListener(
     "click",
     () => void guarded("Planning and simulating", () => preview("revoke")),
+  );
+  $("preview-sync-owner").addEventListener(
+    "click",
+    () => void guarded("Planning and simulating", () => preview("sync-owner")),
   );
   $("token").addEventListener("change", () => {
     $("custom-token-row").hidden = (input("token") as unknown as HTMLSelectElement).value !== "custom";
