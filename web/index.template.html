@@ -59,6 +59,10 @@
           handler, removes any guard, brings escrows, streams, vaults and spend-key floats back into the
           account, then sends every token and all ETH to the destination.
         </p>
+        <label class="inline"
+          ><input id="include-recovery" type="checkbox" /> also remove the guardian recovery module (kept by
+          default: it is your own safety net, not an agent or bank power)</label
+        >
         <button id="preview-exit" type="button">Preview exit</button>
         <button id="preview-revoke" type="button" class="secondary">
           Preview: only revoke agent and bank powers

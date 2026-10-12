@@ -20,6 +20,11 @@ All notable changes to `@agentbank/exit` are documented here. The format follows
 - Atomic revocation: every Safe module (including the Safe7579 adapter) is disabled and the fallback
   handler reset in one Safe transaction through the canonical MultiSendCallOnly (code hash checked);
   a transaction guard is removed first.
+- Guardian recovery (Candide SocialRecoveryModule, contracts ADR 0002): `inspect` reports the
+  guardians, the threshold and any pending recovery. `disable-modules` and `exit` keep the module
+  unless `--include-recovery` is passed, and compute each `disableModule` `prev` pointer around it.
+- Agent spend-key floats (contracts ADR 0001) with a live allowance to the account are shown by
+  `inspect` and pulled back by `exit` (`transferFrom`) before the final withdrawal.
 - `inspect` reports the Safe configuration, Agent Bank executors and hook (TopUpExecutor,
   SweepExecutor, AgentPolicyHook), treasury-fund shares, and a plain-language split between what can
   be recovered now and what becomes recoverable later (with dates).

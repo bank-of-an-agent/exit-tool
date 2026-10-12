@@ -10,6 +10,7 @@ import {
 import { SAFE7579_ADAPTER, SAFE_V141, SENTINEL, ZERO_ADDRESS } from "../../src/core/constants";
 import { decodeMultiSend, encodeMultiSend, MULTISEND_CALL_ONLY } from "../../src/core/multisend";
 import {
+  recoveryKeptNote,
   planCancelStreams,
   planExit,
   planRefundEscrows,
@@ -74,6 +75,78 @@ describe("planRevoke", () => {
       fallbackHandler: SAFE_V141.compatibilityFallbackHandler,
     };
     expect(planRevoke(clean)).toEqual([]);
+  });
+});
+
+describe("guardian recovery module", () => {
+  const RECOVERY: Address = "0x38275826E1933303E508433dD5f289315Da2541c";
+  const withRecovery = (modules: Address[]) => {
+    const report = makeReport({
+      recovery: {
+        module: RECOVERY,
+        delayLabel: "72 hours",
+        delaySeconds: 259_200n,
+        guardians: [OTHER, OWNER],
+        threshold: 2n,
+      },
+    });
+    report.safe = { ...report.safe, modules, guard: ZERO_ADDRESS };
+    return report;
+  };
+
+  /** Applies decoded disableModule calls to a model of the Safe's module linked list, as the Safe would. */
+  function applyRemovals(modules: Address[], calls: { data: `0x${string}` }[]): Address[] {
+    const next = new Map<string, string>();
+    const keys = [SENTINEL, ...modules, SENTINEL].map((a) => a.toLowerCase());
+    for (let i = 0; i < keys.length - 1; i++) next.set(keys[i]!, keys[i + 1]!);
+    for (const c of calls) {
+      const d = decodeFunctionData({ abi: safeAbi, data: c.data });
+      if (d.functionName !== "disableModule") continue;
+      const [prev, module] = (d.args as [Address, Address]).map((a) => a.toLowerCase());
+      // Safe v1.4.1: require(modules[prevModule] == module, "GS103")
+      expect(next.get(prev!), `GS103 for ${module}`).toBe(module);
+      next.set(prev!, next.get(module!)!);
+      next.delete(module!);
+    }
+    const out: Address[] = [];
+    for (let k = next.get(SENTINEL.toLowerCase()); k && k !== SENTINEL.toLowerCase(); k = next.get(k))
+      out.push(k as Address);
+    return out;
+  }
+
+  it("is kept by default, wherever it sits in the module list, with valid prev pointers", () => {
+    for (const modules of [
+      [RECOVERY, OTHER, SAFE7579_ADAPTER],
+      [OTHER, RECOVERY, SAFE7579_ADAPTER],
+      [OTHER, SAFE7579_ADAPTER, RECOVERY],
+    ] as Address[][]) {
+      const steps = planRevoke(withRecovery(modules), { batch: false });
+      const calls = steps.map((s) => s.build(0n));
+      expect(applyRemovals(modules, calls)).toEqual([RECOVERY.toLowerCase()]);
+      // Batched, the same inner calls run in order inside one transaction.
+      const batch = planRevoke(withRecovery(modules), { batch: true });
+      expect(batch).toHaveLength(1);
+      expect(applyRemovals(modules, decodeMultiSend(batch[0]!.build(0n).data)!)).toEqual([
+        RECOVERY.toLowerCase(),
+      ]);
+    }
+  });
+
+  it("is removed too with includeRecovery, and the kept module is explained", () => {
+    const modules = [OTHER, RECOVERY, SAFE7579_ADAPTER] as Address[];
+    const steps = planRevoke(withRecovery(modules), { batch: false, includeRecovery: true });
+    expect(
+      applyRemovals(
+        modules,
+        steps.map((s) => s.build(0n)),
+      ),
+    ).toEqual([]);
+    expect(recoveryKeptNote(withRecovery(modules)).join("")).toMatch(
+      /kept .*2 of 2 guardians.*--include-recovery/,
+    );
+    expect(recoveryKeptNote(withRecovery(modules), { includeRecovery: true })).toEqual([]);
+    const exit = planExit(withRecovery(modules), { to: DEST });
+    expect(exit.skipped.join("\n")).toMatch(/guardian recovery module .* kept/);
   });
 });
 

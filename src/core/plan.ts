@@ -87,6 +87,22 @@ export interface RevokeOptions {
    * whether that contract was verified on this chain during inspection.
    */
   batch?: boolean;
+  /** Also remove the guardian recovery module (kept by default: it is the owner's safety net). */
+  includeRecovery?: boolean;
+}
+
+/** Whether the guardian recovery module stays enabled under these options. */
+export function recoveryKept(report: AccountReport, options: RevokeOptions = {}): boolean {
+  return Boolean(report.recovery) && !options.includeRecovery;
+}
+
+/** The note explaining a kept recovery module, if any. */
+export function recoveryKeptNote(report: AccountReport, options: RevokeOptions = {}): string[] {
+  if (!recoveryKept(report, options)) return [];
+  const r = report.recovery!;
+  return [
+    `guardian recovery module ${r.module} kept (${r.threshold} of ${r.guardians.length} guardians, ${r.delayLabel} delay); pass --include-recovery to remove it`,
+  ];
 }
 
 /**
@@ -112,17 +128,24 @@ export function planRevoke(report: AccountReport, options: RevokeOptions = {}): 
         ),
     });
   }
-  // Modules are removed from the head of the linked list, so `prev` is always the sentinel.
+  // The Safe keeps modules in a linked list: `disableModule(prev, module)` needs the module that
+  // precedes it in the list as it will be at that moment (kept modules stay in place).
+  const kept = recoveryKept(report, options) ? report.recovery!.module : undefined;
+  const current = [...report.safe.modules];
   const removals: { id: string; title: string; note: string; call: Call }[] = [];
   for (const module of report.safe.modules) {
+    if (kept && isAddressEqual(module, kept)) continue;
+    const index = current.findIndex((m) => isAddressEqual(m, module));
+    const prev = index <= 0 ? SENTINEL : current[index - 1]!;
+    current.splice(index, 1);
     const label = report.labels[module.toLowerCase()];
     removals.push({
       id: `disable-module:${module}`,
       title: `Disable module ${module}${label ? ` (${label.split(" (")[0]})` : ""}`,
-      note: `disableModule(prev = SENTINEL, module = ${module})`,
+      note: `disableModule(prev = ${isAddressEqual(prev, SENTINEL) ? "SENTINEL" : prev}, module = ${module})`,
       call: selfCall(
         account,
-        encodeFunctionData({ abi: safeAbi, functionName: "disableModule", args: [SENTINEL, module] }),
+        encodeFunctionData({ abi: safeAbi, functionName: "disableModule", args: [prev, module] }),
       ),
     });
   }
@@ -493,6 +516,8 @@ export interface ExitOptions {
   signer?: Address;
   /** See RevokeOptions.batch. */
   batch?: boolean;
+  /** See RevokeOptions.includeRecovery. */
+  includeRecovery?: boolean;
 }
 
 /**
@@ -507,12 +532,13 @@ export function planExit(report: AccountReport, options: ExitOptions): Plan {
   const to = getAddress(options.to);
   const steps: PlanStep[] = [];
   const skipped: string[] = [];
-  steps.push(
-    ...planRevoke(report, {
-      keepGuard: options.keepGuard ?? false,
-      ...(options.batch !== undefined ? { batch: options.batch } : {}),
-    }),
-  );
+  const revokeOptions: RevokeOptions = {
+    keepGuard: options.keepGuard ?? false,
+    includeRecovery: options.includeRecovery ?? false,
+    ...(options.batch !== undefined ? { batch: options.batch } : {}),
+  };
+  steps.push(...planRevoke(report, revokeOptions));
+  skipped.push(...recoveryKeptNote(report, revokeOptions));
   const streams = planCancelStreams(report);
   const escrows = planRefundEscrows(report);
   const vaults = planWithdrawVaults(report, {

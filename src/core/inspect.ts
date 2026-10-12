@@ -1,5 +1,6 @@
 import { getAddress, isAddressEqual, type Address, type PublicClient } from "viem";
 import { agentPolicyHookAbi, erc20Abi, sweepExecutorAbi, topUpExecutorAbi } from "./abis/index";
+import { formatTimestamp } from "./describe";
 import { formatAmount } from "./amounts";
 import type { ChainConfig } from "./chains";
 import { SAFE7579_ADAPTER, SAFE_V141, ZERO_ADDRESS } from "./constants";
@@ -25,6 +26,7 @@ import {
   type TokenInfo,
   type VaultPosition,
 } from "./positions";
+import { readRecoveryState, type RecoveryState } from "./recovery";
 import { readSafeState, type SafeState } from "./safe";
 
 export interface InspectOptions {
@@ -88,6 +90,8 @@ export interface AccountReport {
   multiSendCallOnly?: Address;
   /** Treasury-sweep fund shares held by the account (SweepExecutor configuration), if any. */
   fundShares?: { fund: TokenInfo; balance: bigint };
+  /** Guardian recovery (Candide SocialRecoveryModule), when enabled. Kept unless --include-recovery. */
+  recovery?: RecoveryState;
 }
 
 const KNOWN_SINGLETONS: Record<string, string> = {
@@ -122,6 +126,8 @@ function safeFindings(
   labels: Record<string, string>,
   compatibilityFallbackHandler: Address,
   signer: Address | undefined,
+  recovery: RecoveryState | undefined,
+  now: bigint,
 ): Finding[] {
   const findings: Finding[] = [];
   if (safe.version !== "1.4.1") {
@@ -139,6 +145,7 @@ function safeFindings(
     });
   }
   for (const m of safe.modules) {
+    if (recovery && isAddressEqual(m, recovery.module)) continue;
     const label = labels[m.toLowerCase()];
     findings.push({
       severity: "danger",
@@ -146,6 +153,7 @@ function safeFindings(
       message: `Module ${m}${label ? ` (${label})` : " (unknown)"} is enabled: it can move funds without the owner key. disable-modules / exit removes it.`,
     });
   }
+  if (recovery) findings.push(...recoveryFindings(recovery, now));
   const handler = safe.fallbackHandler;
   if (isAddressEqual(handler, SAFE7579_ADAPTER)) {
     findings.push({
@@ -258,7 +266,15 @@ export async function inspectAccount(client: PublicClient, options: InspectOptio
         "No contract is deployed at this address yet (counterfactual account). Funds sent to it are safe but can only be moved after the Safe is deployed with its original setup parameters.",
     });
   } else {
-    report.findings.push(...safeFindings(safe, labels, options.compatibilityFallbackHandler, signer));
+    const recovery = await readRecoveryState(client, account, safe.modules, block.number);
+    if (recovery) {
+      report.recovery = recovery;
+      labels[recovery.module.toLowerCase()] =
+        `Candide SocialRecoveryModule (guardian recovery, ${recovery.delayLabel})`;
+    }
+    report.findings.push(
+      ...safeFindings(safe, labels, options.compatibilityFallbackHandler, signer, recovery, block.timestamp),
+    );
   }
 
   const addToken = async (token: Address): Promise<void> => {
@@ -321,8 +337,14 @@ export async function inspectAccount(client: PublicClient, options: InspectOptio
     const all = new Map<string, Address>();
     for (const k of [...explicit, ...spendKeyDiscovery.candidates]) all.set(k.toLowerCase(), k);
     all.delete(account.toLowerCase());
-    if (all.size > 0)
-      report.spendKeys = await readSpendKeys(client, options.usdc, [...all.values()], account);
+    if (all.size > 0) {
+      const floats = await readSpendKeys(client, options.usdc, [...all.values()], account);
+      // Keys found from Approval events only matter while their allowance to the account is live
+      // (a later approval of 0 revokes it); keys given with --spend-key are always shown.
+      report.spendKeys = floats.filter(
+        (k) => k.allowance > 0n || explicit.some((e) => isAddressEqual(e, k.address)),
+      );
+    }
   }
 
   for (const token of new Set([
@@ -350,6 +372,34 @@ export async function inspectAccount(client: PublicClient, options: InspectOptio
     });
   }
   return report;
+}
+
+/** What the owner should know about guardian recovery (contracts ADR 0002). */
+function recoveryFindings(recovery: RecoveryState, now: bigint): Finding[] {
+  const out: Finding[] = [];
+  const n = BigInt(recovery.guardians.length);
+  out.push({
+    severity: "info",
+    code: "recovery_module",
+    message: `Guardian recovery is enabled (Candide SocialRecoveryModule ${recovery.module}, ${recovery.delayLabel} delay): ${recovery.threshold} of ${n} guardians [${recovery.guardians.join(", ")}] can replace the owners after the delay unless the owner cancels. disable-modules and exit keep it; pass --include-recovery to remove it too.`,
+  });
+  if (n > 0n && (recovery.threshold < 2n || recovery.threshold * 2n <= n)) {
+    out.push({
+      severity: "warning",
+      code: "recovery_policy",
+      message: `The recovery threshold ${recovery.threshold} of ${n} breaks Agent Bank's policy (a strict majority, and at least 2): fewer guardians than intended can start a recovery.`,
+    });
+  }
+  if (recovery.pending) {
+    const p = recovery.pending;
+    const ready = now >= p.executeAfter;
+    out.push({
+      severity: "danger",
+      code: "recovery_pending",
+      message: `A guardian recovery is pending: ${ready ? "since" : "from"} ${formatTimestamp(p.executeAfter)} anyone can finalize it, replacing the owners with [${p.newOwners.join(", ")}] (threshold ${p.newThreshold}). If you did not ask for this, cancel it now with an owner transaction calling cancelRecovery() on ${recovery.module}.`,
+    });
+  }
+  return out;
 }
 
 /**

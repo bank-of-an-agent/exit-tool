@@ -28,6 +28,7 @@ import {
 } from "../core/execute";
 import { assertOperable, inspectAccount, type AccountReport } from "../core/inspect";
 import {
+  recoveryKeptNote,
   planCancelStreams,
   planExit,
   planRefundEscrows,
@@ -302,6 +303,9 @@ async function runCommand(command: Exclude<Command, "submit" | "help">, ctx: Con
       printer.line("Not recoverable yet (run exit again once these become available):");
       for (const p of pending) printer.line(`  - ${tokenAmount(report, p.token, p.amount)}: ${p.label}`);
     }
+    for (const note of plan.skipped.filter((s) => s.startsWith("guardian recovery module"))) {
+      printer.line(`Kept: ${note}.`);
+    }
   } else if (plan.skipped.length > 0) {
     printer.line("Left alone:");
     for (const s of plan.skipped) printer.line(`  - ${s}`);
@@ -458,12 +462,13 @@ async function buildPlan(
         skipped: [],
       };
     }
-    case "disable-modules":
-      return {
-        ...base,
-        steps: planRevoke(report, { keepGuard: values["keep-guard"] === true }),
-        skipped: [],
+    case "disable-modules": {
+      const options = {
+        keepGuard: values["keep-guard"] === true,
+        includeRecovery: values["include-recovery"] === true,
       };
+      return { ...base, steps: planRevoke(report, options), skipped: recoveryKeptNote(report, options) };
+    }
     case "refund-escrows": {
       requireAgentBank(report, "escrow");
       const r = planRefundEscrows(report, ids ? { ids } : {});
@@ -498,6 +503,7 @@ async function buildPlan(
       return planExit(report, {
         to,
         keepGuard: values["keep-guard"] === true,
+        includeRecovery: values["include-recovery"] === true,
         unlockedOnly: values["unlocked-only"] === true,
         skipSpendKeys: values["skip-spend-keys"] === true,
         extraTokens,

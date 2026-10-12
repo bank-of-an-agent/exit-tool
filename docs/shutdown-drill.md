@@ -145,6 +145,24 @@ The `--signer-only` payload files were also signed with `cast wallet sign --data
 command the CLI prints for Ledger users (here with a private key instead of a device). `submit`
 accepted the signature and simulated the resulting transaction.
 
+## Base Sepolia fork check
+
+An opt-in suite, `RUN_FORK_TESTS=1 pnpm test:integration test/integration/base-sepolia-fork.test.ts`
+(or the `base-sepolia-fork` CI job), runs the tool against a local Anvil fork of Base Sepolia at
+block 48,000,000. Nothing is sent to Base Sepolia itself. On the fork it meets the real deployed
+contracts: Safe v1.4.1, the Safe7579 adapter, the canonical MultiSendCallOnly, Circle's FiatToken
+USDC (minted through the master-minter path), and Candide's SocialRecoveryModule (72 h) with 3
+guardians, threshold 2 and a pending recovery started by two guardians.
+
+The suite passed on 2026-10-11 (2 tests, about 15 s):
+
+- `inspect` recognised the recovery module by address and code hash, and listed its guardians,
+  threshold and pending recovery.
+- `disable-modules` removed the adapter and the bank module in one batch and kept the recovery
+  module.
+- `exit` moved 500 USDC and 1 ETH to the destination.
+- `--include-recovery` then removed the recovery module.
+
 ## What the drill does not cover
 
 - **The Safe7579 adapter's own bytecode** is not executed. Its address is registered as a module

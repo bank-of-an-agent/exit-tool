@@ -92,10 +92,10 @@ export function agentBankArtifact(name: string): Artifact | undefined {
 // Clients
 // ------------------------------------------------------------------------------------------------
 
-export function clients(rpcUrl: string) {
+export function clients(rpcUrl: string, chainId = 31337) {
   const chain = defineChain({
-    id: 31337,
-    name: "Anvil",
+    id: chainId,
+    name: chainId === 31337 ? "Anvil" : `Anvil fork of ${chainId}`,
     nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
     rpcUrls: { default: { http: [rpcUrl] } },
   });
@@ -227,7 +227,7 @@ export async function ownerExec(
     nonce,
   };
   const signature = await accounts.owner.signTypedData({
-    domain: { chainId: 31337, verifyingContract: safe },
+    domain: { chainId: c.chain.id, verifyingContract: safe },
     types: {
       SafeTx: [
         { name: "to", type: "address" },

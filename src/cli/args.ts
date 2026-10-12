@@ -50,6 +50,7 @@ const OPTIONS = {
   amount: { type: "string" },
   ids: { type: "string" },
   "keep-guard": { type: "boolean" },
+  "include-recovery": { type: "boolean" },
   "unlocked-only": { type: "boolean" },
   "skip-spend-keys": { type: "boolean" },
   "extra-token": { type: "string", multiple: true },
@@ -94,12 +95,20 @@ const SIGNING: OptionName[] = [
 const PER_COMMAND: Record<Command, OptionName[]> = {
   inspect: ["keystore", "signer"],
   withdraw: [...SIGNING, "to", "token", "amount"],
-  "disable-modules": [...SIGNING, "keep-guard"],
+  "disable-modules": [...SIGNING, "keep-guard", "include-recovery"],
   "refund-escrows": [...SIGNING, "ids"],
   "cancel-streams": [...SIGNING, "ids"],
   "withdraw-vaults": [...SIGNING, "ids", "unlocked-only"],
   "sweep-spend-keys": [...SIGNING],
-  exit: [...SIGNING, "to", "keep-guard", "unlocked-only", "skip-spend-keys", "extra-token"],
+  exit: [
+    ...SIGNING,
+    "to",
+    "keep-guard",
+    "include-recovery",
+    "unlocked-only",
+    "skip-spend-keys",
+    "extra-token",
+  ],
   submit: [...SIGNING],
   help: [],
 };
@@ -209,15 +218,16 @@ Commands
                        --to <address> --token usdc|eth|<erc20> --amount <decimal>|all
   disable-modules    Remove every Safe module (incl. the Safe7579 adapter), reset the fallback
                      handler to the plain CompatibilityFallbackHandler, remove the guard
-                     (--keep-guard to keep it). Revokes every agent and bank power.
+                     (--keep-guard to keep it). Revokes every agent and bank power. The guardian
+                     recovery module is kept unless --include-recovery.
   refund-escrows     Refund expired escrows the account paid into [--ids 1,2]
   cancel-streams     Cancel streams the account pays (the payee keeps what it earned) [--ids …]
   withdraw-vaults    Return time-lock vaults to the account; locked ones with your owner's
                      EIP-712 signature [--ids …] [--unlocked-only]
   sweep-spend-keys   Pull agent spend-key floats back with their permit allowance [--spend-key …]
   exit               All of the above in a safe order, then withdraw every token and all ETH:
-                       --to <address> [--keep-guard] [--unlocked-only] [--skip-spend-keys]
-                       [--extra-token <erc20>]…
+                       --to <address> [--keep-guard] [--include-recovery] [--unlocked-only]
+                       [--skip-spend-keys] [--extra-token <erc20>]…
   submit             Execute a --signer-only plan file with its signatures:
                        --plan-file <file> --signature <hex>… [--execute]
 

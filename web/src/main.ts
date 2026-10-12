@@ -23,7 +23,7 @@ import { formatAmount, parseAmount } from "../../src/core/amounts";
 import { assertSupportedChainId, txUrl, type ChainConfig } from "../../src/core/chains";
 import { ZERO_ADDRESS } from "../../src/core/constants";
 import { mergeDeployments, parseDeployments, type Deployments } from "../../src/core/deployments";
-import { describeCall } from "../../src/core/describe";
+import { describeCall, formatTimestamp } from "../../src/core/describe";
 import { ExitToolError } from "../../src/core/errors";
 import { executePlan, type ExecutedStep, type ProgressEvent } from "../../src/core/execute";
 import { inspectAccount, type AccountReport } from "../../src/core/inspect";
@@ -279,6 +279,18 @@ function renderReport(report: AccountReport): void {
       : `${s.fallbackHandler}${report.labels[s.fallbackHandler.toLowerCase()] ? ` (${report.labels[s.fallbackHandler.toLowerCase()]})` : ""}`,
   );
   row(t, "Guard", isAddressEqual(s.guard, ZERO_ADDRESS) ? "none" : s.guard);
+  const r = report.recovery;
+  row(
+    t,
+    "Guardian recovery",
+    r
+      ? `${r.threshold} of ${r.guardians.length} guardians (${r.guardians.join(", ")}), ${r.delayLabel} delay${
+          r.pending
+            ? `; PENDING: owners become ${r.pending.newOwners.join(", ")} from ${formatTimestamp(r.pending.executeAfter)}`
+            : "; nothing pending"
+        }`
+      : "not enabled",
+  );
   const balances = [
     `${formatEther(report.eth)} ETH`,
     ...Object.entries(report.tokens).map(
@@ -334,12 +346,13 @@ async function preview(kind: "withdraw" | "exit" | "revoke"): Promise<void> {
   const client = state.client;
   if (!report || !client) throw new ExitToolError("invalid_argument", "Inspect the account first.");
   let plan: Plan;
+  const includeRecovery = input("include-recovery").checked;
   if (kind === "revoke") {
     plan = {
       command: "disable-modules",
       chainId: report.chain.id,
       account: report.account,
-      steps: planRevoke(report),
+      steps: planRevoke(report, { includeRecovery }),
       skipped: [],
     };
   } else {
@@ -347,7 +360,7 @@ async function preview(kind: "withdraw" | "exit" | "revoke"): Promise<void> {
     if (isAddressEqual(to, report.account))
       throw new ExitToolError("invalid_argument", "The destination is the account itself.");
     if (kind === "exit") {
-      plan = planExit(report, { to, ...(state.wallet ? { signer: state.wallet } : {}) });
+      plan = planExit(report, { to, includeRecovery, ...(state.wallet ? { signer: state.wallet } : {}) });
     } else {
       const tokenChoice = (input("token") as unknown as HTMLSelectElement).value;
       const all = input("all").checked;

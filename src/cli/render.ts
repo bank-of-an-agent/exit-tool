@@ -50,6 +50,18 @@ export function renderReport(report: AccountReport, summary: RecoverySummary, ch
       `Fallback    ${isAddressEqual(s.fallbackHandler, ZERO_ADDRESS) ? "none" : label(report, s.fallbackHandler)}`,
     );
     out.push(`Guard       ${isAddressEqual(s.guard, ZERO_ADDRESS) ? "none" : s.guard}`);
+    const r = report.recovery;
+    if (r) {
+      out.push(
+        `Recovery    ${r.module} (Candide SocialRecoveryModule, ${r.delayLabel}): ${r.threshold} of ${r.guardians.length} guardians`,
+      );
+      for (const g of r.guardians) out.push(`              guardian ${g}`);
+      out.push(
+        r.pending
+          ? `            PENDING: owners become [${r.pending.newOwners.join(", ")}] from ${formatTimestamp(r.pending.executeAfter)}`
+          : "            no recovery pending",
+      );
+    }
   }
   if (report.signer && !report.signer.isOwner)
     out.push(`Your key    ${report.signer.address} is NOT an owner`);

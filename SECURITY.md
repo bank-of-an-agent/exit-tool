@@ -49,6 +49,13 @@ Phase 5 gate.
 
 ## Known limitations
 
+- **Guardian recovery is kept.** `disable-modules` and `exit` keep Candide's SocialRecoveryModule
+  (contracts ADR 0002), the owner's own safety net. It is recognised only at its audited addresses
+  with its audited code hash; any other module is removed. Pass `--include-recovery` to remove it
+  too. While it stays enabled, a threshold of the guardians can replace the owners after the delay.
+  `inspect` reports the guardians, the threshold and any pending recovery, which the owner can cancel
+  with `cancelRecovery()`.
+
 - **Guards.** A Safe transaction guard can veto any owner transaction, including the one removing it.
   Agent Bank does not install guards; the tool removes any guard first and the simulation shows
   whether the guard allows it.

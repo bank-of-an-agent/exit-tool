@@ -10,6 +10,10 @@ on:
         description: "Fail (instead of skipping) the Agent Bank parts of the drill when the contracts cannot be built"
         type: boolean
         default: false
+      run_fork_tests:
+        description: "Also run the Base Sepolia fork tests (real Safe7579, recovery module and USDC; needs network)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -90,3 +94,25 @@ jobs:
           AGENTBANK_CONTRACTS_OUT: ${{ steps.build.outcome == 'success' && format('{0}/.agentbank-contracts/out', github.workspace) || '' }}
           REQUIRE_AGENTBANK_CONTRACTS: ${{ inputs.require_contracts && '1' || '0' }}
         run: pnpm test:integration
+
+  base-sepolia-fork:
+    name: Base Sepolia fork (real Safe7579, recovery module, USDC)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_fork_tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.4
+      - run: pnpm install --frozen-lockfile
+      - name: Fork tests (local Anvil fork; nothing is sent to Base Sepolia)
+        env:
+          RUN_FORK_TESTS: "1"
+          BASE_SEPOLIA_RPC_URL: ${{ secrets.BASE_SEPOLIA_RPC_URL }}
+        run: pnpm test:integration test/integration/base-sepolia-fork.test.ts
