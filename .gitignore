@@ -1,0 +1,15 @@
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Signer-only plans and payloads written by the CLI (they contain no secrets, but they are per-run).
+agentbank-exit-*/
+
+# Never commit keys.
+*.keystore.json
+keystore/

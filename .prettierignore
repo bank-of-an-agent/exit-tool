@@ -1,0 +1,6 @@
+pnpm-lock.yaml
+dist
+coverage
+web/index.html
+src/core/abis/generated
+test/fixtures/contracts/*.json
