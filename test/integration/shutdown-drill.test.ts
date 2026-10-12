@@ -10,50 +10,31 @@
  * co-signer, bundler or indexer exists. The owner runs `agentbank-exit` with only the RPC URL and
  * the owner key, and every recoverable unit must reach the owner's destination.
  */
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { createCipheriv, createHash, randomBytes, scryptSync } from "node:crypto";
-import {
-  encodeFunctionData,
-  getAddress,
-  keccak256,
-  maxUint256,
-  parseEther,
-  parseEventLogs,
-  toHex,
-  type Abi,
-  type Address,
-  type Hex,
-} from "viem";
+import { getAddress, keccak256, parseEther, parseEventLogs, type Abi, type Address, type Hex } from "viem";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { SAFE7579_ADAPTER, SAFE_V141, ZERO_ADDRESS } from "../../src/core/constants";
+import { SAFE_V141 } from "../../src/core/constants";
 import { agentBankAbiSource } from "../../src/core/abis/index";
-import { startAnvil, findAnvil, type AnvilInstance } from "./anvil";
+import { findAnvil } from "./anvil";
+import { accounts, CONTRACTS_OUT, createSafe, ownerExec, runCli, SAFE_ARTIFACTS, send } from "./harness";
 import {
-  accounts,
-  agentBankArtifact,
-  clients,
-  CONTRACTS_OUT,
-  createSafe,
-  deploy,
-  installSafeInfra,
-  moduleExec,
-  ownerExec,
-  runCli,
-  SAFE_ARTIFACTS,
-  send,
-  type Clients,
-} from "./harness";
+  call,
+  DAY,
+  DESTINATION,
+  escrowArt,
+  haveAgentBank,
+  read as readWith,
+  setupDrill,
+  shutDown as shutDownWith,
+  streamsArt,
+  travel as travelWith,
+  vaultsArt,
+  type Drill,
+} from "./scenario";
 
-const DAY = 86_400n;
 const anvilAvailable = findAnvil() !== undefined;
-const escrowArt = agentBankArtifact("AgentEscrow");
-const streamsArt = agentBankArtifact("PaymentStreams");
-const vaultsArt = agentBankArtifact("TimeLockVaults");
-const usdcArt = agentBankArtifact("MockUSDC");
-const haveAgentBank = Boolean(escrowArt && streamsArt && vaultsArt && usdcArt);
-
 if (!anvilAvailable) {
   console.warn("shutdown drill SKIPPED: anvil not found (install Foundry, set ANVIL_BIN, or provide nix).");
 }
@@ -66,56 +47,15 @@ if (anvilAvailable && !haveAgentBank) {
   console.warn(message);
 }
 
-/** A fresh address nobody controls in this test: the owner's cold wallet. */
-const DESTINATION = getAddress(keccak256(toHex("agentbank-exit drill destination")).slice(0, 42));
-
-interface Drill {
-  anvil: AnvilInstance;
-  c: Clients;
-  safe: Address;
-  usdc: Address;
-  usdcAbi: Abi;
-  decimals: number;
-  guard: Address;
-  /** Token units given to the account at setup. */
-  minted: bigint;
-  dir: string;
-  deploymentsFile: string;
-  ab?: {
-    escrow: Address;
-    streams: Address;
-    vaults: Address;
-    escrowAbi: Abi;
-    streamsAbi: Abi;
-    vaultsAbi: Abi;
-    ids: {
-      escrowA: bigint; // expired after 2 days: refundable now
-      escrowB: bigint; // expires after 30 days: pending
-      escrowC: bigint; // disputed by the payee: refundable after expiry + 30 days
-      escrowD: bigint; // already released to the payee: nothing to recover
-      s1: bigint; // per-second stream the account pays
-      s2: bigint; // daily stream to a payee USDC later freezes
-      s3: bigint; // incoming stream (another agent pays the account)
-      v1: bigint; // unlocks after 1 day
-      v2: bigint; // locked for a year, owned by the owner key: early withdrawal
-      v3: bigint; // locked 20 days, owned by another key: pending
-    };
-  };
-}
-
 let drill: Drill;
 /** Incoming stream 3: what phase 1 collected (phase 2 must collect exactly the rest). */
 let settledBeforePhase2 = 0n;
 const usdc = (n: number | bigint): bigint => BigInt(n) * 10n ** BigInt(drill.decimals);
-
-async function read<T>(
-  address: Address,
-  abi: Abi,
-  functionName: string,
-  args: readonly unknown[] = [],
-): Promise<T> {
-  return (await drill.c.publicClient.readContract({ address, abi, functionName, args: args as never })) as T;
-}
+const read = <T>(address: Address, abi: Abi, functionName: string, args: readonly unknown[] = []) =>
+  readWith<T>(drill, address, abi, functionName, args);
+const travel = (seconds: bigint) => travelWith(drill, seconds);
+const shutDown = () => shutDownWith(drill);
+const lastId = (address: Address, abi: Abi, counter: string) => read<bigint>(address, abi, counter);
 
 async function balanceOf(holder: Address): Promise<bigint> {
   return read<bigint>(drill.usdc, drill.usdcAbi, "balanceOf", [holder]);
@@ -123,200 +63,6 @@ async function balanceOf(holder: Address): Promise<bigint> {
 
 async function nowTs(): Promise<bigint> {
   return (await drill.c.publicClient.getBlock({ blockTag: "latest" })).timestamp;
-}
-
-async function travel(seconds: bigint): Promise<void> {
-  await drill.c.test.increaseTime({ seconds: Number(seconds) });
-  await drill.c.test.mine({ blocks: 1 });
-}
-
-function call(abi: Abi, functionName: string, args: readonly unknown[] = []): Hex {
-  return encodeFunctionData({ abi, functionName, args: args as never });
-}
-
-/** Id returned by a create function, read from the counter right after the call. */
-async function lastId(address: Address, abi: Abi, counter: string): Promise<bigint> {
-  return read<bigint>(address, abi, counter);
-}
-
-async function setup(): Promise<Drill> {
-  const anvil = await startAnvil();
-  const c = clients(anvil.rpcUrl);
-  await installSafeInfra(c);
-
-  // Token: Agent Bank's MockUSDC (6 decimals, blacklist) or, without the contracts repo, a plain ERC-20.
-  let token: Address;
-  let usdcAbi: Abi;
-  if (usdcArt) {
-    const ctor = usdcArt.abi.find((x) => x.type === "constructor") as
-      { inputs?: { type: string }[] } | undefined;
-    token = await deploy(
-      c,
-      "deployer",
-      usdcArt,
-      (ctor?.inputs ?? []).map(() => accounts.deployer.address),
-    );
-    usdcAbi = usdcArt.abi;
-  } else {
-    token = await deploy(c, "deployer", SAFE_ARTIFACTS.testToken);
-    usdcAbi = SAFE_ARTIFACTS.testToken.abi;
-  }
-  const decimals = Number(
-    await c.publicClient.readContract({ address: token, abi: usdcAbi, functionName: "decimals" }),
-  );
-  const guard = await deploy(c, "deployer", SAFE_ARTIFACTS.debugGuard);
-
-  // The account, configured like an Agent Bank account: Safe7579 adapter as module and fallback
-  // handler; a second module standing in for the bank's executor powers; a transaction guard.
-  const safe = await createSafe(c, [accounts.owner.address], 1n, SAFE7579_ADAPTER, 1n);
-  const safeAbi = SAFE_ARTIFACTS.safeL2.abi;
-  await ownerExec(c, safe, safe, call(safeAbi, "enableModule", [SAFE7579_ADAPTER]));
-  await ownerExec(c, safe, safe, call(safeAbi, "enableModule", [accounts.bank.address]));
-  await ownerExec(c, safe, safe, call(safeAbi, "setGuard", [guard]));
-  await send(c, "deployer", safe, "0x", parseEther("2"));
-  let minted: bigint;
-  if (usdcArt) {
-    minted = 10_000n * 10n ** BigInt(decimals);
-    await send(c, "deployer", token, call(usdcAbi, "mint", [safe, minted]));
-  } else {
-    // The stand-in token mints a fixed supply to its deployer.
-    minted = (await c.publicClient.readContract({
-      address: token,
-      abi: usdcAbi,
-      functionName: "balanceOf",
-      args: [accounts.deployer.address],
-    })) as bigint;
-    await send(c, "deployer", token, call(usdcAbi, "transfer", [safe, minted]));
-  }
-
-  const dir = mkdtempSync(path.join(tmpdir(), "agentbank-exit-drill-"));
-  const deploymentsFile = path.join(dir, "deployments.json");
-  const result: Drill = {
-    anvil,
-    c,
-    safe,
-    usdc: token,
-    usdcAbi,
-    decimals,
-    guard,
-    minted,
-    dir,
-    deploymentsFile,
-  };
-  drill = result;
-
-  if (!haveAgentBank) {
-    writeFileSync(
-      deploymentsFile,
-      JSON.stringify({ chainId: 31337, dependencies: { USDC: token } }, null, 2),
-    );
-    return result;
-  }
-
-  // Agent Bank contracts with a pause guardian (the bank's last act before shutting down is to pause them).
-  const guardian = accounts.guardian.address;
-  const escrow = await deploy(c, "deployer", escrowArt!, [guardian, ZERO_ADDRESS]);
-  const streams = await deploy(c, "deployer", streamsArt!, [guardian]);
-  const vaults = await deploy(c, "deployer", vaultsArt!, [guardian]);
-  writeFileSync(
-    deploymentsFile,
-    JSON.stringify(
-      {
-        chainId: 31337,
-        contracts: { AgentEscrow: escrow, PaymentStreams: streams, TimeLockVaults: vaults },
-        dependencies: { USDC: token },
-        mode: "broadcast",
-      },
-      null,
-      2,
-    ),
-  );
-  const escrowAbi = escrowArt!.abi;
-  const streamsAbi = streamsArt!.abi;
-  const vaultsAbi = vaultsArt!.abi;
-  const u = (n: number): bigint => BigInt(n) * 10n ** BigInt(decimals);
-
-  // Agent activity, executed through a module exactly as the Safe7579 adapter executes agent sessions.
-  const agent = (to: Address, data: Hex) => moduleExec(c, "bank", safe, to, data);
-  const t0 = (await c.publicClient.getBlock({ blockTag: "latest" })).timestamp;
-  const lock = async (payee: Address, amount: bigint, expiresAt: bigint, arbiter: Address) => {
-    await agent(token, call(usdcAbi, "approve", [escrow, amount]));
-    await agent(
-      escrow,
-      call(escrowAbi, "lock", [
-        token,
-        payee,
-        amount,
-        expiresAt,
-        arbiter,
-        ZERO_ADDRESS,
-        `0x${"0".repeat(64)}`,
-        0,
-        keccak256(toHex("terms")),
-      ]),
-    );
-    return lastId(escrow, escrowAbi, "escrowCount");
-  };
-  const escrowA = await lock(accounts.payee.address, u(100), t0 + 3_600n, ZERO_ADDRESS);
-  const escrowB = await lock(accounts.payee2.address, u(50), t0 + 30n * DAY, ZERO_ADDRESS);
-  const escrowC = await lock(accounts.payee.address, u(25), t0 + 7_200n, accounts.relayer.address);
-  await send(c, "payee", escrow, call(escrowAbi, "dispute", [escrowC]));
-  const escrowD = await lock(accounts.payee.address, u(10), t0 + 3_600n, ZERO_ADDRESS);
-  await agent(escrow, call(escrowAbi, "release", [escrowD]));
-
-  const stream = async (payee: Address, deposit: bigint, rate: bigint, interval: bigint) => {
-    await agent(token, call(usdcAbi, "approve", [streams, deposit]));
-    await agent(streams, call(streamsAbi, "createStream", [token, payee, deposit, rate, interval, 0n, 0n]));
-    return lastId(streams, streamsAbi, "streamCount");
-  };
-  const s1 = await stream(accounts.payee.address, u(1000), u(1) / 1000n, 1n); // 0.001 USDC per second
-  const s2 = await stream(accounts.payee2.address, u(200), u(10), DAY); // 10 USDC per day
-  // Another agent streams to the account.
-  await send(c, "deployer", token, call(usdcAbi, "mint", [accounts.otherAgent.address, u(100)]));
-  await send(c, "otherAgent", token, call(usdcAbi, "approve", [streams, u(100)]));
-  await send(
-    c,
-    "otherAgent",
-    streams,
-    call(streamsAbi, "createStream", [token, safe, u(100), u(1) / 2000n, 1n, 0n, 0n]),
-  );
-  const s3 = await lastId(streams, streamsAbi, "streamCount");
-
-  const vault = async (unlockIn: bigint, owner: Address, amount: bigint) => {
-    await agent(vaults, call(vaultsAbi, "createVault", [token, t0 + unlockIn, owner]));
-    const id = await lastId(vaults, vaultsAbi, "vaultCount");
-    await agent(token, call(usdcAbi, "approve", [vaults, amount]));
-    await agent(vaults, call(vaultsAbi, "deposit", [id, amount]));
-    return id;
-  };
-  const v1 = await vault(DAY, accounts.owner.address, u(300));
-  const v2 = await vault(365n * DAY, accounts.owner.address, u(500));
-  const v3 = await vault(20n * DAY, accounts.guardian.address, u(40));
-
-  // Agent spend keys (ADR 0001): floats outside the account, recoverable through a permit allowance.
-  await send(c, "deployer", token, call(usdcAbi, "mint", [accounts.spendKey.address, u(25)]));
-  await send(c, "spendKey", token, call(usdcAbi, "approve", [safe, maxUint256]));
-  await send(c, "deployer", token, call(usdcAbi, "mint", [accounts.spendKey2.address, u(5)]));
-
-  result.ab = {
-    escrow,
-    streams,
-    vaults,
-    escrowAbi,
-    streamsAbi,
-    vaultsAbi,
-    ids: { escrowA, escrowB, escrowC, escrowD, s1, s2, s3, v1, v2, v3 },
-  };
-  return result;
-}
-
-/** Agent Bank shuts down: contracts paused (inflows only), a counterparty frozen by USDC, no services. */
-async function shutDown(): Promise<void> {
-  const ab = drill.ab!;
-  await send(drill.c, "guardian", ab.escrow, call(ab.escrowAbi, "pause"));
-  await send(drill.c, "guardian", ab.streams, call(ab.streamsAbi, "pause"));
-  await send(drill.c, "guardian", ab.vaults, call(ab.vaultsAbi, "pause"));
-  await send(drill.c, "deployer", drill.usdc, call(drill.usdcAbi, "blacklist", [accounts.payee2.address]));
 }
 
 const cliBase = () => [
@@ -354,7 +100,7 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
   const summary: string[] = [];
 
   beforeAll(async () => {
-    drill = await setup();
+    drill = await setupDrill();
   });
 
   afterAll(async () => {

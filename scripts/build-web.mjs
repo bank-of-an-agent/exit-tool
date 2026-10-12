@@ -25,10 +25,21 @@ const js = result.outputFiles[0].text.trim().replaceAll("</script", "<\\/script"
 const css = readFileSync(path.join(root, "web/src/style.css"), "utf8").trim();
 const sha = (text) => `'sha256-${createHash("sha256").update(text, "utf8").digest("base64")}'`;
 
+const template = readFileSync(path.join(root, "web/index.template.html"), "utf8");
+const assembled = template.replace("/*__STYLE__*/", () => css).replace("/*__SCRIPT__*/", () => js);
+
+// Hash exactly what the browser hashes: the full text inside the (single) inline <script> and <style>,
+// including the template's indentation around the placeholders.
+const inline = (tag) => {
+  const matches = [...assembled.matchAll(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, "g"))];
+  if (matches.length !== 1) throw new Error(`expected exactly one inline <${tag}> in the template`);
+  return matches[0][1];
+};
+
 const csp = [
   "default-src 'none'",
-  `script-src ${sha(js)}`,
-  `style-src ${sha(css)}`,
+  `script-src ${sha(inline("script"))}`,
+  `style-src ${sha(inline("style"))}`,
   "img-src data:",
   // All chain access goes through the injected wallet: the page itself never connects anywhere.
   "connect-src 'none'",
@@ -36,11 +47,7 @@ const csp = [
   "form-action 'none'",
 ].join("; ");
 
-const template = readFileSync(path.join(root, "web/index.template.html"), "utf8");
-const html = template
-  .replace("__CSP__", () => csp)
-  .replace("/*__STYLE__*/", () => css)
-  .replace("/*__SCRIPT__*/", () => js);
+const html = assembled.replace("__CSP__", () => csp);
 
 const out = path.join(root, "web/index.html");
 if (check) {

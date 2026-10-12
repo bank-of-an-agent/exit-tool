@@ -60,11 +60,11 @@ async function rpcReady(url: string): Promise<boolean> {
   }
 }
 
-/** Starts a fresh anvil on a random port. Extra args are passed through (e.g. `--chain-id`). */
-export async function startAnvil(extraArgs: string[] = []): Promise<AnvilInstance> {
+/** Starts a fresh anvil (on a random port unless one is given). Extra args are passed through. */
+export async function startAnvil(extraArgs: string[] = [], fixedPort?: number): Promise<AnvilInstance> {
   const found = findAnvil();
   if (!found) throw new Error("anvil not found (set ANVIL_BIN, install Foundry, or have nix available)");
-  const port = await freePort();
+  const port = fixedPort ?? (await freePort());
   const args = [...found.prefix, "--host", "127.0.0.1", "--port", String(port), ...extraArgs];
   const child: ChildProcess = spawn(found.command, args, { stdio: ["ignore", "pipe", "pipe"] });
   let output = "";

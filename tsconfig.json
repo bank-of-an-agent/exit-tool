@@ -22,5 +22,5 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["src", "test", "tsup.config.ts", "vitest.config.ts"]
+  "include": ["src", "test", "scripts/*.ts", "tsup.config.ts", "vitest.config.ts"]
 }

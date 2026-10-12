@@ -468,7 +468,11 @@ function renderPlan(report: AccountReport, plan: Plan, sim: SimulationResult): v
     box.append(
       el("p", "This Safe needs several owner signatures: use the CLI's --signer-only flow.", "danger"),
     );
-  button.addEventListener("click", () => void guarded("Sending", execute));
+  button.addEventListener("click", () => {
+    // One run per preview: after sending, inspect and preview again for anything left.
+    button.disabled = true;
+    void guarded("Sending", execute);
+  });
   box.append(button);
   box.append(el("div", "", "log"));
 }
