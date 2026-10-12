@@ -7,8 +7,9 @@ must never stop an owner from getting their money out.
 
 ## Result
 
-**Passed.** Run on 2026-10-11 with `@agentbank/exit` 0.1.0, Anvil 1.8.4 and the Agent Bank
-contracts at commit `2c44a19`. All 11 drill tests passed in about 9 seconds.
+**Passed.** Run on 2026-10-11 with `@agentbank/exit` 0.1.0, Anvil 1.8.4 and the final Agent Bank
+contracts at commit `c758b66` (every source hash recorded in the build artifacts matches it). All 11
+drill tests passed in about 9 seconds.
 
 | Check                    | Result                                                                                                                                                                                                                                                                          |
 | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
