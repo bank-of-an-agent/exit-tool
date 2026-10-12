@@ -30,9 +30,13 @@ Phase 5 gate.
   Safe7579 adapter and every ERC-7579 module or hook. Steps that anyone may perform (escrow refunds
   after expiry, unlocked vault withdrawals, stream settlements) are plain calls whose contracts can
   only pay the account.
-- **CALL only, no refunds.** The tool only produces `operation = CALL` SafeTxs with
-  `safeTxGas = baseGas = gasPrice = 0`: the Safe never pays the executor, and a failing inner call
-  reverts the whole transaction. Plan files with any other values are rejected.
+- **CALLs, no refunds.** Every SafeTx has `safeTxGas = baseGas = gasPrice = 0`: the Safe never
+  pays the executor, and a failing inner call reverts the whole transaction. All SafeTxs are CALLs
+  except one: the atomic revoke, a DELEGATECALL to the canonical Safe MultiSendCallOnly. The tool
+  uses it only after checking that contract's runtime code hash on the chain. MultiSendCallOnly can
+  only make CALLs, and here it only calls `disableModule` and `setFallbackHandler` on the account
+  itself. Plan files that break any of these rules are rejected. Public steps in a plan file may only
+  call the refund, settle and withdraw functions, with no value.
 - **Dry run by default.** Plans are simulated in full (one `eth_simulateV1` block) before anything is
   signed. Dry runs stand in for owner signatures with a simulation-only ERC-1271 stub installed by a
   state override; it never reaches the chain. Execution re-checks every step with `eth_call` right
