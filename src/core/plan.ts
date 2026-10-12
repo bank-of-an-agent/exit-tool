@@ -1,6 +1,6 @@
 import { encodeFunctionData, getAddress, isAddressEqual, type Address, type Hex } from "viem";
 import { agentEscrowAbi, erc20Abi, paymentStreamsAbi, safeAbi, timeLockVaultsAbi } from "./abis/index";
-import { SENTINEL, ZERO_ADDRESS } from "./constants";
+import { SAFE7579_ADAPTER, SENTINEL, ZERO_ADDRESS } from "./constants";
 import { encodeMultiSend, MULTISEND_CALL_ONLY } from "./multisend";
 import { formatTimestamp } from "./describe";
 import { ExitToolError } from "./errors";
@@ -149,11 +149,15 @@ export function planRevoke(report: AccountReport, options: RevokeOptions = {}): 
       ),
     });
   }
+  // The plain handler when it is verified on this chain; otherwise remove the handler (address(0)).
   const handler = report.compatibilityFallbackHandler;
   if (!isAddressEqual(report.safe.fallbackHandler, handler)) {
+    const removing = isAddressEqual(handler, ZERO_ADDRESS);
     removals.push({
       id: `set-fallback-handler:${handler}`,
-      title: `Reset the fallback handler to the plain CompatibilityFallbackHandler ${handler}`,
+      title: removing
+        ? "Remove the fallback handler (no verified CompatibilityFallbackHandler on this chain)"
+        : `Reset the fallback handler to the plain CompatibilityFallbackHandler ${handler}`,
       note: `setFallbackHandler(${handler}), was ${report.safe.fallbackHandler}`,
       call: selfCall(
         account,
@@ -191,6 +195,33 @@ export function planRevoke(report: AccountReport, options: RevokeOptions = {}): 
     }
   }
   return steps;
+}
+
+/**
+ * Refuses destinations that cannot be the owner's wallet: zero, the account itself, its modules,
+ * the tokens and the Agent Bank contracts.
+ */
+export function assertDestination(report: AccountReport, to: Address): Address {
+  const destination = getAddress(to);
+  if (isAddressEqual(destination, ZERO_ADDRESS)) {
+    throw new ExitToolError("invalid_argument", "The destination cannot be the zero address.");
+  }
+  if (isAddressEqual(destination, report.account)) {
+    throw new ExitToolError("invalid_argument", "The destination is the account itself.");
+  }
+  const forbidden = [
+    SAFE7579_ADAPTER,
+    ...report.safe.modules,
+    ...Object.values(report.contracts).filter((a): a is Address => Boolean(a)),
+    ...Object.values(report.tokens).map((t) => t.address),
+  ];
+  if (forbidden.some((a) => isAddressEqual(a, destination))) {
+    throw new ExitToolError(
+      "invalid_argument",
+      `The destination ${destination} is a module, token or Agent Bank contract, not a wallet you control.`,
+    );
+  }
+  return destination;
 }
 
 // ---------------------------------------------------------------------------------------------

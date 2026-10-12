@@ -67,7 +67,6 @@ export async function connect(values: Values, io: Io): Promise<Connection> {
 export async function resolveDeployments(values: Values, io: Io, chain: ChainConfig): Promise<Deployments> {
   const builtIn: Deployments = {
     contracts: {},
-    compatibilityFallbackHandler: chain.compatibilityFallbackHandler,
     ...(chain.usdc ? { usdc: chain.usdc } : {}),
   };
   let fromFile: Deployments | undefined;
@@ -90,8 +89,6 @@ export async function resolveDeployments(values: Values, io: Io, chain: ChainCon
   const flags: Deployments = { contracts: {} };
   const usdc = parseAddressOption("usdc", values.usdc);
   if (usdc) flags.usdc = usdc;
-  const handler = parseAddressOption("fallback-handler", values["fallback-handler"]);
-  if (handler) flags.compatibilityFallbackHandler = handler;
   const escrow = parseAddressOption("escrow", values.escrow);
   if (escrow) flags.contracts.escrow = escrow;
   const streams = parseAddressOption("streams", values.streams);

@@ -1,4 +1,4 @@
-import { getAddress, hashTypedData, type Address, type Hex, type PublicClient } from "viem";
+import { getAddress, hashTypedData, isAddressEqual, type Address, type Hex, type PublicClient } from "viem";
 import { timeLockVaultsAbi } from "./abis/index";
 import { ExitToolError } from "./errors";
 
@@ -25,14 +25,34 @@ export interface EarlyWithdrawal {
   deadline: bigint;
 }
 
-/** Reads the TimeLockVaults EIP-712 domain (ERC-5267) instead of assuming it. */
-export async function readVaultDomain(client: PublicClient, vaults: Address): Promise<VaultDomain> {
+/**
+ * Reads the TimeLockVaults EIP-712 domain (ERC-5267) and checks it belongs to the connected chain and
+ * to the vaults contract itself, so an RPC cannot get the owner to sign a message valid elsewhere
+ * (for example on mainnet, where the vault addresses are the same).
+ */
+export async function readVaultDomain(
+  client: PublicClient,
+  vaults: Address,
+  expectedChainId: number,
+): Promise<VaultDomain> {
   const [, name, version, chainId, verifyingContract] = await client.readContract({
     address: vaults,
     abi: timeLockVaultsAbi,
     functionName: "eip712Domain",
   });
-  return { name, version, chainId: Number(chainId), verifyingContract: getAddress(verifyingContract) };
+  const domain = {
+    name,
+    version,
+    chainId: Number(chainId),
+    verifyingContract: getAddress(verifyingContract),
+  };
+  if (domain.chainId !== expectedChainId || !isAddressEqual(domain.verifyingContract, vaults)) {
+    throw new ExitToolError(
+      "signature_mismatch",
+      `TimeLockVaults ${vaults} reports an EIP-712 domain for chain ${domain.chainId} / ${domain.verifyingContract}, not chain ${expectedChainId} / ${vaults}. Refusing to sign.`,
+    );
+  }
+  return domain;
 }
 
 export function earlyWithdrawalTypedData(domain: VaultDomain, message: EarlyWithdrawal) {

@@ -12,7 +12,7 @@ import {
   type PublicClient,
 } from "viem";
 import { agentEscrowAbi, erc20Abi, multicall3Abi, paymentStreamsAbi, timeLockVaultsAbi } from "./abis/index";
-import { MULTICALL3 } from "./constants";
+import { MULTICALL3, SAFE_V141 } from "./constants";
 import type { AgentBankContracts } from "./deployments";
 import { ExitToolError } from "./errors";
 import { describeError } from "./revert";
@@ -196,6 +196,10 @@ export async function findDeploymentBlock(
   try {
     if (!(await hasCode(hi))) return undefined;
     if (await hasCode(lo)) return lo;
+    // Some pruned nodes answer "no code" for old blocks instead of failing. Only trust the search if
+    // the node shows a contract that certainly existed at `lo` (the canonical Safe singleton).
+    const history = await client.getCode({ address: SAFE_V141.safeL2, blockNumber: lo });
+    if (history === undefined || history === "0x") return undefined;
     let low = lo; // no code
     let high = hi; // code
     while (high - low > 1n) {
@@ -220,11 +224,19 @@ export interface PositionIds {
   toBlock?: bigint;
   requests: number;
   notes: string[];
+  /** Enumeration only: records that could not be read (positions may be missing). */
+  failedReads: number;
 }
 
 export interface DiscoveryOptions {
   mode: "auto" | "events" | "enumerate";
+  /** Where scans for INCOMING positions start (they may predate the account's deployment). */
   fromBlock: bigint;
+  /**
+   * Where scans for positions the account CREATED start: they need the account to exist, so its
+   * deployment block is safe here. Defaults to `fromBlock`.
+   */
+  outgoingFromBlock?: bigint;
   toBlock: bigint;
   maxLogRequests: number;
   /** Use Multicall3 at its canonical address when it has code. */
@@ -261,7 +273,7 @@ async function discoverByEvents(
     const res = await scanLogs(
       client,
       { address: asPayer.map((c) => c.address), topics: [asPayer.map((c) => c.topic), null, accountTopic] },
-      options.fromBlock,
+      options.outgoingFromBlock ?? options.fromBlock,
       options.toBlock,
       { maxRequests: budget() },
     );
@@ -309,6 +321,7 @@ async function discoverByEvents(
     toBlock: options.toBlock,
     requests,
     notes: [],
+    failedReads: 0,
   };
 }
 
@@ -372,6 +385,7 @@ async function discoverByEnumeration(
     method: "enumeration",
     requests: 0,
     notes: [],
+    failedReads: 0,
   };
   const range = (n: bigint): bigint[] => Array.from({ length: Number(n) }, (_, i) => BigInt(i + 1));
 
@@ -395,7 +409,10 @@ async function discoverByEnumeration(
     );
     ids.forEach((id, i) => {
       const raw = data[i];
-      if (!raw) return;
+      if (!raw) {
+        result.failedReads += 1;
+        return;
+      }
       const e = decodeFunctionResult({ abi: agentEscrowAbi, functionName: "getEscrow", data: raw });
       if (isAddressEqual(e.payer, account) || isAddressEqual(e.payee, account)) result.escrows.push(id);
     });
@@ -421,7 +438,10 @@ async function discoverByEnumeration(
     );
     ids.forEach((id, i) => {
       const raw = data[i];
-      if (!raw) return;
+      if (!raw) {
+        result.failedReads += 1;
+        return;
+      }
       const s = decodeFunctionResult({ abi: paymentStreamsAbi, functionName: "getStream", data: raw });
       if (isAddressEqual(s.payer, account) || isAddressEqual(s.payee, account)) result.streams.push(id);
     });
@@ -447,7 +467,10 @@ async function discoverByEnumeration(
     );
     ids.forEach((id, i) => {
       const raw = data[i];
-      if (!raw) return;
+      if (!raw) {
+        result.failedReads += 1;
+        return;
+      }
       const parent = decodeFunctionResult({
         abi: timeLockVaultsAbi,
         functionName: "vaultAccount",
@@ -482,6 +505,7 @@ export async function discoverPositionIds(
       method: "events",
       requests: 0,
       notes: ["no Agent Bank contracts configured"],
+      failedReads: 0,
     };
   }
   if (options.mode === "enumerate") return discoverByEnumeration(client, account, contracts, options);

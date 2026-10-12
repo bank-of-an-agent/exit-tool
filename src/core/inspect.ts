@@ -1,9 +1,14 @@
-import { getAddress, isAddressEqual, type Address, type PublicClient } from "viem";
+import { getAddress, isAddressEqual, keccak256, type Address, type PublicClient } from "viem";
 import { agentPolicyHookAbi, erc20Abi, sweepExecutorAbi, topUpExecutorAbi } from "./abis/index";
 import { formatTimestamp } from "./describe";
 import { formatAmount } from "./amounts";
 import type { ChainConfig } from "./chains";
-import { SAFE7579_ADAPTER, SAFE_V141, ZERO_ADDRESS } from "./constants";
+import {
+  COMPATIBILITY_FALLBACK_HANDLER_CODEHASH,
+  SAFE7579_ADAPTER,
+  SAFE_V141,
+  ZERO_ADDRESS,
+} from "./constants";
 import type { AgentBankContracts } from "./deployments";
 import {
   discoverPositionIds,
@@ -85,6 +90,10 @@ export interface AccountReport {
   findings: Finding[];
   /** Human labels for known addresses (lowercase keys). */
   labels: Record<string, string>;
+  /**
+   * The plain fallback handler the revoke installs: the canonical CompatibilityFallbackHandler v1.4.1
+   * when its code hash is verified on this chain, otherwise address(0) (no handler, which is safe).
+   */
   compatibilityFallbackHandler: Address;
   /** The canonical MultiSendCallOnly, when its code was verified on this chain (enables the atomic revoke). */
   multiSendCallOnly?: Address;
@@ -106,7 +115,6 @@ export function knownLabels(
   const labels: Record<string, string> = {
     [SAFE7579_ADAPTER.toLowerCase()]:
       "Safe7579 adapter (ERC-7579 modules: agent session keys, policy hook, executors)",
-    [options.compatibilityFallbackHandler.toLowerCase()]: "CompatibilityFallbackHandler (plain Safe handler)",
     [SAFE_V141.compatibilityFallbackHandler.toLowerCase()]: "CompatibilityFallbackHandler v1.4.1",
     ...KNOWN_SINGLETONS,
   };
@@ -173,7 +181,7 @@ function safeFindings(
     findings.push({
       severity: "warning",
       code: "fallback_unknown",
-      message: `The fallback handler ${handler} is not the plain CompatibilityFallbackHandler. disable-modules / exit replaces it.`,
+      message: `The fallback handler ${handler} is not the verified CompatibilityFallbackHandler v1.4.1 (it can answer ERC-1271 signature checks for the account). disable-modules / exit replaces it.`,
     });
   }
   if (!isAddressEqual(safe.guard, ZERO_ADDRESS)) {
@@ -245,7 +253,12 @@ export async function inspectAccount(client: PublicClient, options: InspectOptio
     spendKeys: [],
     findings: [],
     labels,
-    compatibilityFallbackHandler: options.compatibilityFallbackHandler,
+    compatibilityFallbackHandler: (await isCanonicalFallbackHandler(
+      client,
+      options.compatibilityFallbackHandler,
+    ))
+      ? options.compatibilityFallbackHandler
+      : ZERO_ADDRESS,
   };
   if (signer)
     report.signer = { address: signer, isOwner: safe.owners.some((o) => isAddressEqual(o, signer)) };
@@ -273,8 +286,16 @@ export async function inspectAccount(client: PublicClient, options: InspectOptio
         `Candide SocialRecoveryModule (guardian recovery, ${recovery.delayLabel})`;
     }
     report.findings.push(
-      ...safeFindings(safe, labels, options.compatibilityFallbackHandler, signer, recovery, block.timestamp),
+      ...safeFindings(safe, labels, report.compatibilityFallbackHandler, signer, recovery, block.timestamp),
     );
+    if (isAddressEqual(report.compatibilityFallbackHandler, ZERO_ADDRESS)) {
+      report.findings.push({
+        severity: "warning",
+        code: "no_verified_fallback_handler",
+        message:
+          "No CompatibilityFallbackHandler v1.4.1 with the audited code exists at its canonical address on this chain: the revoke removes the fallback handler instead of replacing it (ERC-1271 signatures by the account stop working, which is safe).",
+      });
+    }
   }
 
   const addToken = async (token: Address): Promise<void> => {
@@ -298,22 +319,32 @@ export async function inspectAccount(client: PublicClient, options: InspectOptio
 
   if (options.positions === false || !safe.deployed) return report;
 
-  // Positions can only exist after the account existed: start event scans there.
+  // Incoming escrows/streams and spend-key approvals can target the account's address before it is
+  // deployed (counterfactual), so they are scanned from the Agent Bank floor. Positions the account
+  // created need it deployed, so those scans may start at its deployment block.
   const floor = [options.chain.agentBankGenesisBlock, options.fromBlock ?? 0n].reduce((a, b) =>
     b > a ? b : a,
   );
   const lo = floor < block.number ? floor : block.number;
   const accountDeployedAt = await findDeploymentBlock(client, account, lo, block.number);
-  const scanFromBlock = accountDeployedAt ?? lo;
+  const scanFromBlock = lo;
   const maxLogRequests = options.discovery?.maxLogRequests ?? 500;
 
   const positions = await discoverPositionIds(client, account, contracts, {
     mode: options.discovery?.mode ?? "auto",
     fromBlock: scanFromBlock,
+    ...(accountDeployedAt !== undefined ? { outgoingFromBlock: accountDeployedAt } : {}),
     toBlock: block.number,
     maxLogRequests,
   });
   report.discovery = { positions, scanFromBlock };
+  if (positions.failedReads > 0) {
+    report.findings.push({
+      severity: "danger",
+      code: "discovery_incomplete",
+      message: `${positions.failedReads} escrow/stream/vault records could not be read from the RPC: positions may be missing from this report. Run it again or use another RPC before relying on it.`,
+    });
+  }
   if (accountDeployedAt !== undefined) report.discovery.accountDeployedAt = accountDeployedAt;
 
   if (contracts.escrow && positions.escrows.length > 0) {
@@ -337,6 +368,10 @@ export async function inspectAccount(client: PublicClient, options: InspectOptio
     const all = new Map<string, Address>();
     for (const k of [...explicit, ...spendKeyDiscovery.candidates]) all.set(k.toLowerCase(), k);
     all.delete(account.toLowerCase());
+    // The owner's own wallet may have approved the account: it is not an agent spend key.
+    for (const o of safe.owners) {
+      if (!explicit.some((e) => isAddressEqual(e, o))) all.delete(o.toLowerCase());
+    }
     if (all.size > 0) {
       const floats = await readSpendKeys(client, options.usdc, [...all.values()], account);
       // Keys found from Approval events only matter while their allowance to the account is live
@@ -467,6 +502,13 @@ async function executorFindings(
       message: `The SweepExecutor is installed (fund ${config.fund}): keepers can move USDC into that fund until the Safe7579 adapter is disabled. The account holds ${formatAmount(balance, fund.decimals)} ${fund.symbol} fund shares; exit leaves them in place unless you add --extra-token ${config.fund} (or redeem them with the fund).`,
     });
   }
+}
+
+/** Whether `address` holds exactly the CompatibilityFallbackHandler v1.4.1 code. */
+export async function isCanonicalFallbackHandler(client: PublicClient, address: Address): Promise<boolean> {
+  if (!isAddressEqual(address, SAFE_V141.compatibilityFallbackHandler)) return false;
+  const code = await client.getCode({ address });
+  return code !== undefined && code !== "0x" && keccak256(code) === COMPATIBILITY_FALLBACK_HANDLER_CODEHASH;
 }
 
 /** Throws a clear error when the account cannot be operated by the given signer. */

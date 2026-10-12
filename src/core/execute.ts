@@ -1,4 +1,5 @@
 import {
+  encodeEventTopics,
   encodeFunctionData,
   getAddress,
   isAddressEqual,
@@ -8,10 +9,13 @@ import {
   type Hex,
   type PublicClient,
 } from "viem";
-import { safeAbi, timeLockVaultsAbi } from "./abis/index";
+import { erc20Abi, safeAbi, timeLockVaultsAbi } from "./abis/index";
 import { ExitToolError } from "./errors";
 import type { Plan } from "./plan";
+import { scanLogs } from "./discovery";
 import { describeError } from "./revert";
+
+const EXECUTION_SUCCESS_TOPIC = encodeEventTopics({ abi: safeAbi, eventName: "ExecutionSuccess" })[0];
 import {
   encodeExecTransaction,
   hashSafeTx,
@@ -203,10 +207,20 @@ async function broadcast(
     });
   }
   options.onProgress?.({ type: "sent", index: step.index, title: step.title, hash });
+  let replaced: string | undefined;
   const receipt = await client.waitForTransactionReceipt({
     hash,
     timeout: options.receiptTimeoutMs ?? 180_000,
+    onReplaced: (r) => {
+      if (r.reason !== "repriced") replaced = r.reason;
+    },
   });
+  if (replaced) {
+    throw new ExitToolError(
+      "execution_failed",
+      `Step ${step.index} (${step.title}): transaction ${hash} was ${replaced} by another transaction (${receipt.transactionHash}); check the account and run the command again.`,
+    );
+  }
   if (receipt.status !== "success") {
     throw new ExitToolError(
       "execution_failed",
@@ -245,11 +259,15 @@ export async function executePlan(
   options: ExecuteOptions,
 ): Promise<ExecutedStep[]> {
   const out: ExecutedStep[] = [];
-  const reader = liveReader(client);
   const total = plan.steps.length;
+  let lastBlock = 0n;
   for (const [i, step] of plan.steps.entries()) {
     const index = i + 1;
     options.onProgress?.({ type: "start", index, total, title: step.title });
+    // Read at a block that includes the previous step (a lagging RPC node must not hand back the
+    // balance from before it, or "all" would leave funds behind).
+    const at = await waitForBlock(client, lastBlock);
+    const reader = liveReader(client, at);
     const amount = await resolveAmount(step.amount, reader);
     if (amount !== undefined && amount === 0n) {
       options.onProgress?.({ type: "skipped", index, title: step.title, reason: "nothing to move" });
@@ -266,7 +284,7 @@ export async function executePlan(
           functionName: "getVault",
           args: [req.id],
         }),
-        readVaultDomain(client, req.vaults),
+        readVaultDomain(client, req.vaults, options.chainId),
         client.getBlock({ blockTag: "latest" }),
       ]);
       const message: EarlyWithdrawal = {
@@ -299,7 +317,24 @@ export async function executePlan(
     } else {
       prepared = { to: call.to, data: call.data, value: call.value };
     }
+    // For withdrawals, check the funds really left the account (a token may return false instead of
+    // reverting, which the Safe reports as success).
+    const moved =
+      step.category === "withdraw" && step.moves && amount !== undefined ? step.moves.token : undefined;
     const result = await broadcast(client, prepared, { index, title: step.title }, options);
+    lastBlock = result.blockNumber;
+    if (moved !== undefined) {
+      const [before, after] = await Promise.all([
+        accountBalance(client, options.account, moved, result.blockNumber - 1n),
+        accountBalance(client, options.account, moved, result.blockNumber),
+      ]);
+      if (before - after !== amount) {
+        throw new ExitToolError(
+          "execution_failed",
+          `Step ${index} (${step.title}) was mined in ${result.hash}, but the account's balance went from ${before} to ${after} instead of decreasing by ${amount}: the token did not move the funds.`,
+        );
+      }
+    }
     options.onProgress?.({ type: "confirmed", index, title: step.title, ...result });
     out.push({
       index,
@@ -314,6 +349,59 @@ export async function executePlan(
   return out;
 }
 
+async function accountBalance(
+  client: PublicClient,
+  account: Address,
+  token: Address | "ETH",
+  blockNumber: bigint,
+): Promise<bigint> {
+  if (token === "ETH") return client.getBalance({ address: account, blockNumber });
+  return client.readContract({
+    address: token,
+    abi: erc20Abi,
+    functionName: "balanceOf",
+    args: [account],
+    blockNumber,
+  });
+}
+
+/** The RPC's head block once it is at least `minBlock` (waits up to a minute for lagging nodes). */
+async function waitForBlock(client: PublicClient, minBlock: bigint): Promise<bigint> {
+  const deadline = Date.now() + 60_000;
+  for (;;) {
+    const head = await client.getBlockNumber({ cacheTime: 0 });
+    if (head >= minBlock) return head;
+    if (Date.now() > deadline) {
+      throw new ExitToolError(
+        "rpc_error",
+        `The RPC is stuck at block ${head}, behind block ${minBlock} it already returned.`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+}
+
+/**
+ * The block in which the Safe executed the SafeTx with this hash (its
+ * `ExecutionSuccess(bytes32 indexed txHash, …)` event) at or after `fromBlock`, if it did.
+ */
+export async function findExecutionSuccess(
+  client: PublicClient,
+  safe: Address,
+  safeTxHash: Hex,
+  fromBlock: bigint,
+): Promise<bigint | undefined> {
+  const toBlock = await client.getBlockNumber();
+  const { logs } = await scanLogs(
+    client,
+    { address: safe, topics: [EXECUTION_SUCCESS_TOPIC, safeTxHash] },
+    fromBlock,
+    toBlock,
+    { maxRequests: 2_000 },
+  );
+  return logs[0]?.blockNumber;
+}
+
 /**
  * Executes already-materialized steps (a signer-only plan file) with the signatures collected for
  * them. Safe steps whose nonce was already used are skipped (re-running a partly executed plan is
@@ -325,6 +413,7 @@ export async function executeMaterialized(
   options: ExecuteOptions,
 ): Promise<ExecutedStep[]> {
   const out: ExecutedStep[] = [];
+  let lastBlock = 0n;
   const active = steps.filter((s) => !s.skipped);
   for (const step of active) {
     options.onProgress?.({ type: "start", index: step.index, total: steps.length, title: step.title });
@@ -336,12 +425,15 @@ export async function executeMaterialized(
         address: options.account,
         abi: safeAbi,
         functionName: "nonce",
+        blockNumber: await waitForBlock(client, lastBlock),
       });
       if (nonce > tx.nonce) {
-        const reason = `Safe nonce ${tx.nonce} already used (the step ran before, or another transaction replaced it)`;
-        options.onProgress?.({ type: "skipped", index: step.index, title: step.title, reason });
-        out.push({ index: step.index, id: step.id, title: step.title, status: "skipped", reason });
-        continue;
+        // Callers mark steps they verified as executed (ExecutionSuccess for this SafeTx hash) as
+        // skipped; a nonce used by anything else means the plan is stale.
+        throw new ExitToolError(
+          "plan_mismatch",
+          `Step ${step.index} uses Safe nonce ${tx.nonce}, which another transaction has used: this plan is stale. Create a new one with --signer-only.`,
+        );
       }
       if (nonce < tx.nonce) {
         throw new ExitToolError(
@@ -381,6 +473,7 @@ export async function executeMaterialized(
       prepared = { to: step.call.to, data: step.call.data, value: step.call.value };
     }
     const result = await broadcast(client, prepared, step, options);
+    lastBlock = result.blockNumber;
     options.onProgress?.({ type: "confirmed", index: step.index, title: step.title, ...result });
     out.push({
       index: step.index,

@@ -1,4 +1,15 @@
-import { getAddress, isAddressEqual, toFunctionSelector, type Address, type Hex } from "viem";
+import {
+  decodeFunctionData,
+  formatEther,
+  getAddress,
+  isAddressEqual,
+  toFunctionSelector,
+  type Abi,
+  type Address,
+  type Hex,
+} from "viem";
+import { agentEscrowAbi, erc20Abi, paymentStreamsAbi, safeAbi, timeLockVaultsAbi } from "./abis/index";
+import type { AgentBankContracts } from "./deployments";
 import { ZERO_ADDRESS } from "./constants";
 import { ExitToolError } from "./errors";
 import { decodeMultiSend, MULTISEND_CALL_ONLY } from "./multisend";
@@ -12,6 +23,15 @@ import {
 } from "./vaults";
 
 export const PLAN_FORMAT = "agentbank-exit-plan/v1";
+
+/** Every function a plan step may call, for decoding (shapes are checked in verifyPlanSteps). */
+const PLAN_CALL_ABI = [
+  ...safeAbi,
+  ...erc20Abi,
+  ...agentEscrowAbi,
+  ...paymentStreamsAbi,
+  ...timeLockVaultsAbi,
+] as Abi;
 
 /** disableModule, setFallbackHandler, setGuard: what the revoke batch may call on the account. */
 const REVOKE_SELECTORS = new Set<string>([
@@ -50,6 +70,8 @@ export interface PlanFile {
   account: Address;
   command: string;
   destination?: Address;
+  /** Block the plan was made at: Safe executions of its steps can only appear after it. */
+  block?: string;
   safe: { nonce: string; threshold: string; owners: Address[] };
   steps: unknown[];
   payloads: SignPayload[];
@@ -206,6 +228,7 @@ export function buildPlanFile(input: {
   safe: { nonce: bigint; threshold: bigint; owners: readonly Address[] };
   steps: readonly MaterializedStep[];
   notes: readonly string[];
+  block?: bigint;
   now?: Date;
 }): PlanFile {
   const payloads: SignPayload[] = [];
@@ -237,6 +260,7 @@ export function buildPlanFile(input: {
     account: input.account,
     command: input.command,
     ...(input.destination ? { destination: input.destination } : {}),
+    ...(input.block !== undefined ? { block: input.block.toString() } : {}),
     safe: {
       nonce: input.safe.nonce.toString(),
       threshold: input.safe.threshold.toString(),
@@ -338,4 +362,158 @@ export function parsePlanFile(
     }
   }
   return { file: { ...file, account }, steps };
+}
+
+/** What a plan may do, established at submit time from trusted sources (never from the plan file). */
+export interface TrustedPlanContext {
+  account: Address;
+  /** The destination the user confirmed on the command line (`--to`); required to move funds out. */
+  destination?: Address;
+  /** Agent Bank contracts from the built-in config and the deployments file the user passed. */
+  contracts: AgentBankContracts;
+  /** The verified CompatibilityFallbackHandler, or address(0) when none is verified on this chain. */
+  compatibilityFallbackHandler: Address;
+  /** Whether the canonical MultiSendCallOnly code was verified on this chain. */
+  multiSendVerified: boolean;
+}
+
+function decodeKnown(data: Hex): { functionName: string; args: readonly unknown[] } | undefined {
+  try {
+    const d = decodeFunctionData({ abi: PLAN_CALL_ABI, data });
+    return { functionName: d.functionName, args: d.args ?? [] };
+  } catch {
+    return undefined;
+  }
+}
+
+/** A self-call reconfiguring the account: only the revoke operations, with safe arguments. */
+function describeSelfCall(call: { data: Hex; value: bigint }, ctx: TrustedPlanContext): string | undefined {
+  if (call.value !== 0n) return undefined;
+  const d = decodeKnown(call.data);
+  if (!d) return undefined;
+  if (d.functionName === "setGuard") {
+    return isAddressEqual(d.args[0] as Address, ZERO_ADDRESS) ? "remove the transaction guard" : undefined;
+  }
+  if (d.functionName === "disableModule") return `disable module ${String(d.args[1])}`;
+  if (d.functionName === "setFallbackHandler") {
+    const handler = d.args[0] as Address;
+    if (!isAddressEqual(handler, ctx.compatibilityFallbackHandler)) return undefined;
+    return isAddressEqual(handler, ZERO_ADDRESS)
+      ? "remove the fallback handler"
+      : `set the fallback handler to the verified CompatibilityFallbackHandler ${handler}`;
+  }
+  return undefined;
+}
+
+/**
+ * Checks every step of a plan file against the shapes the planner produces, using only trusted
+ * inputs (the chain, the user's `--to`, the configured contracts), and replaces the file's titles
+ * with descriptions derived from the calldata. A plan file is untrusted input: anything else is
+ * refused before anything is signed or sent.
+ */
+export function verifyPlanSteps(steps: MaterializedStep[], ctx: TrustedPlanContext): void {
+  const refuse = (step: MaterializedStep, why: string): never => {
+    throw new ExitToolError(
+      "plan_mismatch",
+      `Plan step ${step.index} is not something this tool produces: ${why}.`,
+    );
+  };
+  const toDestination = (step: MaterializedStep, to: Address): void => {
+    if (!ctx.destination) {
+      throw new ExitToolError("plan_mismatch", `Plan step ${step.index} sends funds to ${to}.`, {
+        hint: `Confirm the destination with --to ${to} if (and only if) it is your address.`,
+      });
+    }
+    if (!isAddressEqual(to, ctx.destination))
+      refuse(step, `it sends funds to ${to}, not to --to ${ctx.destination}`);
+  };
+  for (const step of steps) {
+    step.notes = [];
+    if (step.skipped) continue;
+    const call = step.call;
+    if (step.via === "safe") {
+      const tx = step.safeTx!;
+      if (tx.operation === 1) {
+        if (!ctx.multiSendVerified) refuse(step, "MultiSendCallOnly is not verified on this chain");
+        const inner = decodeMultiSend(tx.data) ?? [];
+        const parts = inner.map((c) =>
+          isAddressEqual(c.to, ctx.account) ? describeSelfCall(c, ctx) : undefined,
+        );
+        if (parts.length === 0 || parts.some((p) => p === undefined))
+          refuse(step, "the batch does more than revoke");
+        step.title = `In one transaction: ${parts.join("; ")}`;
+        continue;
+      }
+      if (isAddressEqual(call.to, ctx.account)) {
+        const what = describeSelfCall(call, ctx);
+        if (!what) refuse(step, "it changes the account's configuration in a way the exit never does");
+        step.title = what!.charAt(0).toUpperCase() + what!.slice(1);
+        continue;
+      }
+      if (call.data === "0x") {
+        toDestination(step, call.to);
+        step.title = `Send ${formatEther(call.value)} ETH to ${call.to}`;
+        continue;
+      }
+      if (call.value !== 0n) refuse(step, "it sends ETH along with a contract call");
+      const d = decodeKnown(call.data);
+      if (d?.functionName === "transfer") {
+        toDestination(step, d.args[0] as Address);
+        step.title = `Transfer ${String(d.args[1])} units of token ${call.to} to ${String(d.args[0])}`;
+        continue;
+      }
+      if (d?.functionName === "transferFrom") {
+        if (!isAddressEqual(d.args[1] as Address, ctx.account))
+          refuse(step, "it pulls tokens somewhere other than the account");
+        step.title = `Pull ${String(d.args[2])} units of token ${call.to} from ${String(d.args[0])} into the account`;
+        continue;
+      }
+      if (d?.functionName === "cancel") {
+        if (!ctx.contracts.streams || !isAddressEqual(call.to, ctx.contracts.streams)) {
+          refuse(
+            step,
+            `cancel() on ${call.to}, which is not the configured PaymentStreams (pass --deployments)`,
+          );
+        }
+        step.title = `Cancel stream #${String(d.args[0])} (the payee keeps what it earned; the rest returns to the account)`;
+        continue;
+      }
+      refuse(step, `unexpected Safe transaction to ${call.to}`);
+    }
+    // Public steps: only the recovery functions of the configured Agent Bank contracts, no value.
+    if (call.value !== 0n) refuse(step, "a public step sends ETH");
+    const d = decodeKnown(call.data);
+    const expect = (contract: Address | undefined, name: string): void => {
+      if (!contract || !isAddressEqual(call.to, contract)) {
+        refuse(
+          step,
+          `${d?.functionName ?? "call"} on ${call.to}, which is not the configured ${name} (pass --deployments)`,
+        );
+      }
+    };
+    switch (d?.functionName) {
+      case "refund":
+        expect(ctx.contracts.escrow, "AgentEscrow");
+        step.title = `Refund escrow #${String(d.args[0])} to its payer (the account)`;
+        break;
+      case "releaseByValidation":
+        expect(ctx.contracts.escrow, "AgentEscrow");
+        step.title = `Release escrow #${String(d.args[0])} to its payee (the account)`;
+        break;
+      case "settle":
+        expect(ctx.contracts.streams, "PaymentStreams");
+        step.title = `Settle stream #${String(d.args[0])} to its payee (the account)`;
+        break;
+      case "withdraw":
+        expect(ctx.contracts.vaults, "TimeLockVaults");
+        step.title = `Return ${String(d.args[1])} units from vault #${String(d.args[0])} to its account`;
+        break;
+      case "withdrawWithSignature":
+        expect(ctx.contracts.vaults, "TimeLockVaults");
+        step.title = `Early-withdraw ${String(d.args[1])} units from vault #${String(d.args[0])} to its account (owner-signed)`;
+        break;
+      default:
+        refuse(step, `unexpected public call to ${call.to}`);
+    }
+  }
 }

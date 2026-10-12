@@ -27,7 +27,7 @@ import { describeCall, formatTimestamp } from "../../src/core/describe";
 import { ExitToolError } from "../../src/core/errors";
 import { executePlan, type ExecutedStep, type ProgressEvent } from "../../src/core/execute";
 import { inspectAccount, type AccountReport } from "../../src/core/inspect";
-import { planExit, planRevoke, planWithdrawStep, type Plan } from "../../src/core/plan";
+import { assertDestination, planExit, planRevoke, planWithdrawStep, type Plan } from "../../src/core/plan";
 import { readTokenInfo } from "../../src/core/positions";
 import { describeError } from "../../src/core/revert";
 import {
@@ -221,8 +221,7 @@ async function inspect(): Promise<void> {
     chain,
     account,
     ...(deployments.usdc ? { usdc: deployments.usdc } : {}),
-    compatibilityFallbackHandler:
-      deployments.compatibilityFallbackHandler ?? chain.compatibilityFallbackHandler,
+    compatibilityFallbackHandler: chain.compatibilityFallbackHandler,
     contracts: deployments.contracts,
     ...(deployments.fromBlock !== undefined ? { fromBlock: deployments.fromBlock } : {}),
     ...(state.wallet ? { signer: state.wallet } : {}),
@@ -356,9 +355,7 @@ async function preview(kind: "withdraw" | "exit" | "revoke"): Promise<void> {
       skipped: [],
     };
   } else {
-    const to = addressField("to", "Destination");
-    if (isAddressEqual(to, report.account))
-      throw new ExitToolError("invalid_argument", "The destination is the account itself.");
+    const to = assertDestination(report, addressField("to", "Destination"));
     if (kind === "exit") {
       plan = planExit(report, { to, includeRecovery, ...(state.wallet ? { signer: state.wallet } : {}) });
     } else {

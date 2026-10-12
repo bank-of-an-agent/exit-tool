@@ -26,7 +26,6 @@ const OPTIONS = {
   escrow: { type: "string" },
   streams: { type: "string" },
   vaults: { type: "string" },
-  "fallback-handler": { type: "string" },
   "from-block": { type: "string" },
   discovery: { type: "string" },
   "max-log-requests": { type: "string" },
@@ -69,7 +68,6 @@ const GLOBAL: OptionName[] = [
   "escrow",
   "streams",
   "vaults",
-  "fallback-handler",
   "from-block",
   "discovery",
   "max-log-requests",
@@ -109,7 +107,7 @@ const PER_COMMAND: Record<Command, OptionName[]> = {
     "skip-spend-keys",
     "extra-token",
   ],
-  submit: [...SIGNING],
+  submit: [...SIGNING, "to"],
   help: [],
 };
 
@@ -229,14 +227,16 @@ Commands
                        --to <address> [--keep-guard] [--include-recovery] [--unlocked-only]
                        [--skip-spend-keys] [--extra-token <erc20>]…
   submit             Execute a --signer-only plan file with its signatures:
-                       --plan-file <file> --signature <hex>… [--execute]
+                       --plan-file <file> --signature <hex>… [--to <your address>] [--execute]
+                     Every step is checked against what this tool produces; a plan that moves
+                     funds out needs --to with the same destination.
 
 Connection
   --account <address>        The Safe account (required)
   --rpc-url <url>            JSON-RPC endpoint (default: the chain's public RPC)
   --chain base-sepolia|anvil Expected chain (default: detected from the RPC). Mainnet is refused.
   --deployments <file>       Agent Bank contract addresses (JSON). Or --escrow/--streams/--vaults,
-                             --usdc, --fallback-handler, --from-block
+                             --usdc, --from-block
   --discovery auto|events|enumerate   How escrows/streams/vaults are found (default auto)
   --max-log-requests <n>     eth_getLogs budget before falling back to enumeration (default 500)
   --spend-key <address>      Agent spend key to sweep (repeatable; others are found from events)

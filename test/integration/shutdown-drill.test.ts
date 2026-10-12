@@ -11,6 +11,7 @@
  * the owner key, and every recoverable unit must reach the owner's destination.
  */
 import { mkdirSync, writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
 import { createCipheriv, createHash, randomBytes, scryptSync } from "node:crypto";
@@ -76,6 +77,8 @@ const cliBase = () => [
   "--deployments",
   drill.deploymentsFile,
 ];
+/** submit takes its trusted contracts from the same deployments file the plan was made with. */
+const submitBase = () => ["--rpc-url", drill.anvil.rpcUrl, "--deployments", drill.deploymentsFile];
 const ownerEnv = { OWNER_PRIVATE_KEY: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d" };
 
 /** Can the bank's module still move funds? (eth_call of execTransactionFromModule from the module.) */
@@ -447,22 +450,20 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
         ["refund-escrow", "refund-escrow", "settle-stream", "withdraw-vault"].sort(),
       );
       const s1 = await runCli(
-        ["submit", "--rpc-url", drill.anvil.rpcUrl, "--plan-file", plan1, "--execute", "--yes", "--json"],
+        ["submit", ...submitBase(), "--plan-file", plan1, "--execute", "--yes", "--json"],
         relayerEnv,
       );
       expect(s1.code, s1.stderr + s1.stdout).toBe(0);
 
-      // Round 2: sign the withdrawal of everything that came back.
+      // Round 2: the same exit --signer-only command again (as round 1 printed) signs the withdrawal of
+      // everything that came back, all tokens in one plan.
+      expect(signerOnly1.deferred[0]).toMatch(/exit .*--signer-only/);
       const plan2 = path.join(drill.dir, "phase2-withdraw", "plan.json");
       const p2 = await runCli([
-        "withdraw",
+        "exit",
         ...cliBase(),
         "--to",
         DESTINATION,
-        "--token",
-        "usdc",
-        "--amount",
-        "all",
         "--signer-only",
         "--plan-file",
         plan2,
@@ -477,8 +478,9 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
       const s2 = await runCli(
         [
           "submit",
-          "--rpc-url",
-          drill.anvil.rpcUrl,
+          ...submitBase(),
+          "--to",
+          DESTINATION,
           "--plan-file",
           plan2,
           "--signature",
@@ -553,8 +555,7 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
       const submitted = await runCli(
         [
           "submit",
-          "--rpc-url",
-          drill.anvil.rpcUrl,
+          ...submitBase(),
           "--plan-file",
           planFile,
           "--signature",
@@ -592,10 +593,33 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
       expect(payloads2.map((p) => p.kind)).toEqual(["SafeTx"]);
       const sig = await sign(payloads2[0]!.typedData);
       // Without --execute, submit prints ready-to-send transactions for any wallet.
+      // A plan that moves funds out needs the destination confirmed with --to.
+      const unconfirmed = await runCli([
+        "submit",
+        ...submitBase(),
+        "--plan-file",
+        planFile2,
+        "--signature",
+        sig,
+      ]);
+      expect(unconfirmed.code).toBe(1);
+      expect(unconfirmed.stderr).toMatch(/--to/);
+      const elsewhere = await runCli([
+        "submit",
+        ...submitBase(),
+        "--to",
+        accounts.payee.address,
+        "--plan-file",
+        planFile2,
+        "--signature",
+        sig,
+      ]);
+      expect(elsewhere.code).toBe(1);
       const dry = await runCli([
         "submit",
-        "--rpc-url",
-        drill.anvil.rpcUrl,
+        ...submitBase(),
+        "--to",
+        DESTINATION,
         "--plan-file",
         planFile2,
         "--signature",
@@ -609,8 +633,9 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
       const bad = await runCli(
         [
           "submit",
-          "--rpc-url",
-          drill.anvil.rpcUrl,
+          ...submitBase(),
+          "--to",
+          DESTINATION,
           "--plan-file",
           planFile2,
           "--signature",
@@ -626,8 +651,9 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
       const sent = await runCli(
         [
           "submit",
-          "--rpc-url",
-          drill.anvil.rpcUrl,
+          ...submitBase(),
+          "--to",
+          DESTINATION,
           "--plan-file",
           planFile2,
           "--signature",
@@ -646,8 +672,9 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
       const again = await runCli(
         [
           "submit",
-          "--rpc-url",
-          drill.anvil.rpcUrl,
+          ...submitBase(),
+          "--to",
+          DESTINATION,
           "--plan-file",
           planFile2,
           "--signature",
@@ -657,8 +684,73 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
         ],
         { SENDER_PRIVATE_KEY: "0x4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356" },
       );
-      expect(again.code, again.stderr + again.stdout).toBe(0); // the used nonce is detected: nothing to send
-      expect(again.stdout).toMatch(/already/i);
+      expect(again.code, again.stderr + again.stdout).toBe(0); // its SafeTx was executed: nothing to send
+      expect(again.stdout).toMatch(/already been executed/i);
+
+      // Two plans made at the same nonce: once one runs, the other is stale and must not claim success.
+      await send(drill.c, "deployer", drill.safe, "0x", parseEther("0.2"));
+      const planA = path.join(drill.dir, "stale-a", "plan.json");
+      const planB = path.join(drill.dir, "stale-b", "plan.json");
+      for (const [file, amount] of [
+        [planA, "0.1"],
+        [planB, "0.05"],
+      ] as const) {
+        const made = await runCli([
+          "withdraw",
+          ...cliBase(),
+          "--to",
+          DESTINATION,
+          "--token",
+          "eth",
+          "--amount",
+          amount,
+          "--signer-only",
+          "--plan-file",
+          file,
+        ]);
+        expect(made.code, made.stderr).toBe(0);
+      }
+      const payloadOf = async (file: string) =>
+        (JSON.parse(await readFile(file, "utf8")) as { payloads: { typedData: unknown }[] }).payloads[0]!
+          .typedData;
+      const sigA = await sign(await payloadOf(planA));
+      const sigB = await sign(await payloadOf(planB));
+      const relay = {
+        SENDER_PRIVATE_KEY: "0x4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356",
+      };
+      const runA = await runCli(
+        [
+          "submit",
+          ...submitBase(),
+          "--to",
+          DESTINATION,
+          "--plan-file",
+          planA,
+          "--signature",
+          sigA,
+          "--execute",
+          "--yes",
+        ],
+        relay,
+      );
+      expect(runA.code, runA.stderr).toBe(0);
+      const runB = await runCli(
+        [
+          "submit",
+          ...submitBase(),
+          "--to",
+          DESTINATION,
+          "--plan-file",
+          planB,
+          "--signature",
+          sigB,
+          "--execute",
+          "--yes",
+        ],
+        relay,
+      );
+      expect(runB.code).toBe(1);
+      expect(runB.stderr).toMatch(/stale/);
       summary.push(
         "signer-only: EarlyWithdrawal and SafeTx signed via eth_signTypedData_v4, submitted by an unrelated relayer key; wrong signature refused",
       );
@@ -720,6 +812,8 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
         "submit",
         "--rpc-url",
         drill.anvil.rpcUrl,
+        "--to",
+        DESTINATION,
         "--plan-file",
         planFile,
         "--signature",
@@ -737,6 +831,8 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
         "submit",
         "--rpc-url",
         drill.anvil.rpcUrl,
+        "--to",
+        DESTINATION,
         "--plan-file",
         planFile,
         // deliberately in the "wrong" order: the tool sorts signatures by owner address
@@ -766,6 +862,7 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
     writeFileSync(ksFile, JSON.stringify(keystore));
     writeFileSync(pwFile, "correct horse battery staple\n");
     const before = await drill.c.publicClient.getBalance({ address: DESTINATION });
+    const held = await drill.c.publicClient.getBalance({ address: drill.safe });
     const run = await runCli([
       "withdraw",
       ...cliBase(),
@@ -784,9 +881,8 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
       "--json",
     ]);
     expect(run.code, run.stderr + run.stdout).toBe(0);
-    expect((await drill.c.publicClient.getBalance({ address: DESTINATION })) - before).toBe(
-      parseEther("0.5"),
-    );
+    expect((await drill.c.publicClient.getBalance({ address: DESTINATION })) - before).toBe(held);
+    expect(await drill.c.publicClient.getBalance({ address: drill.safe })).toBe(0n);
     expect(run.stdout + run.stderr).not.toContain(ownerEnv.OWNER_PRIVATE_KEY.slice(2));
     const wrongPw = path.join(drill.dir, "wrong.password");
     writeFileSync(wrongPw, "nope");

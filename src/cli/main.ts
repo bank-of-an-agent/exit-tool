@@ -7,20 +7,23 @@ import {
   getAddress,
   http,
   isAddressEqual,
+  numberToHex,
+  pad,
   recoverTypedDataAddress,
   type Address,
   type Hex,
   type LocalAccount,
 } from "viem";
-import { safeAbi, timeLockVaultsAbi } from "../core/abis/index";
+import { timeLockVaultsAbi } from "../core/abis/index";
 import { parseAmount } from "../core/amounts";
 import { txUrl, type ChainConfig } from "../core/chains";
-import { SAFE7579_ADAPTER, SIMULATION_SENDER, ZERO_ADDRESS } from "../core/constants";
+import { SAFE_NONCE_SLOT, SIMULATION_SENDER } from "../core/constants";
 import type { Deployments } from "../core/deployments";
 import { ExitToolError } from "../core/errors";
 import {
   executeMaterialized,
   executePlan,
+  findExecutionSuccess,
   type ExecuteOptions,
   type ExecutedStep,
   type ProgressEvent,
@@ -28,6 +31,7 @@ import {
 } from "../core/execute";
 import { assertOperable, inspectAccount, type AccountReport } from "../core/inspect";
 import {
+  assertDestination,
   recoveryKeptNote,
   planCancelStreams,
   planExit,
@@ -39,9 +43,9 @@ import {
   type CommandName,
   type Plan,
 } from "../core/plan";
-import { buildPlanFile, parsePlanFile, type PlanFile } from "../core/planfile";
+import { buildPlanFile, parsePlanFile, verifyPlanSteps, type PlanFile } from "../core/planfile";
 import { readTokenInfo } from "../core/positions";
-import { describeError, describeRevertData } from "../core/revert";
+import { describeError, describeRevertData, extractRevertData } from "../core/revert";
 import {
   encodeExecTransaction,
   normalizeEcdsaSignature,
@@ -50,8 +54,10 @@ import {
   type OwnerSignature,
 } from "../core/safe";
 import {
+  isUnsupportedMethodError,
   materializeAndSimulate,
   pickSimulationSigners,
+  type StepSimulation,
   type MaterializedStep,
   type SimulationResult,
 } from "../core/simulate";
@@ -171,8 +177,7 @@ async function inspect(
     chain: conn.chain,
     account,
     ...(deployments.usdc ? { usdc: deployments.usdc } : {}),
-    compatibilityFallbackHandler:
-      deployments.compatibilityFallbackHandler ?? conn.chain.compatibilityFallbackHandler,
+    compatibilityFallbackHandler: conn.chain.compatibilityFallbackHandler,
     contracts: deployments.contracts,
     ...(deployments.fromBlock !== undefined ? { fromBlock: deployments.fromBlock } : {}),
     ...(signer ? { signer } : {}),
@@ -241,21 +246,22 @@ async function runCommand(command: Exclude<Command, "submit" | "help">, ctx: Con
   }
 
   const plan = await buildPlan(command as CommandName, report, ctx, signer);
-  await checkPlanTargets(ctx, report, plan);
+  await checkPlanTargets(ctx, plan);
 
   const deferred: string[] = [];
   if (signerOnly && command === "exit" && plan.steps.some((s) => s.category === "recover")) {
-    // Amounts that come back during the exit are only known once those steps ran: sign them in a second round.
-    const kept = plan.steps.filter((s) => !(s.category === "withdraw" && s.amount.kind === "erc20Balance"));
-    for (const s of plan.steps) {
-      if (s.category === "withdraw" && s.amount.kind === "erc20Balance") {
-        const symbol = report.tokens[s.amount.token.toLowerCase()]?.symbol ?? s.amount.token;
-        deferred.push(
-          `agentbank-exit withdraw --account ${account} --to ${plan.destination} --token ${s.amount.token} --amount all --signer-only   (${symbol})`,
-        );
-      }
+    // What comes back during the exit is only known once those steps ran, so the token withdrawals
+    // are signed in a second round: the same command again, which then plans them all in one file
+    // (one plan per round keeps the Safe nonces of a round consecutive).
+    const tokenWithdrawals = plan.steps.filter(
+      (s) => s.category === "withdraw" && s.amount.kind === "erc20Balance",
+    );
+    if (tokenWithdrawals.length > 0) {
+      plan.steps = plan.steps.filter((s) => !tokenWithdrawals.includes(s));
+      deferred.push(
+        `agentbank-exit exit --account ${account} --to ${plan.destination} --signer-only [same connection options]`,
+      );
     }
-    plan.steps = kept;
   }
 
   if (plan.steps.length === 0) {
@@ -343,6 +349,7 @@ async function runCommand(command: Exclude<Command, "submit" | "help">, ctx: Con
       ...(plan.destination ? { destination: plan.destination } : {}),
       safe: { nonce: report.safe.nonce, threshold: report.safe.threshold, owners: report.safe.owners },
       steps: sim.steps,
+      block: report.block.number,
       notes: [
         ...plan.skipped.map((s) => `left alone: ${s}`),
         ...(deferred.length > 0
@@ -531,37 +538,11 @@ function requireDestination(values: Values, report: AccountReport): Address {
   const to = parseAddressOption("to", values.to);
   if (!to)
     throw new ExitToolError("invalid_argument", "--to <address> is required: where your funds should go.");
-  if (isAddressEqual(to, ZERO_ADDRESS))
-    throw new ExitToolError("invalid_argument", "--to cannot be the zero address.");
-  if (isAddressEqual(to, report.account))
-    throw new ExitToolError("invalid_argument", "--to is the account itself.");
-  const forbidden = [
-    SAFE7579_ADAPTER,
-    ...report.safe.modules,
-    ...Object.values(report.contracts).filter((a): a is Address => Boolean(a)),
-    ...Object.values(report.tokens).map((t) => t.address),
-  ];
-  if (forbidden.some((a) => isAddressEqual(a, to))) {
-    throw new ExitToolError(
-      "invalid_argument",
-      `--to ${to} is a module, token or Agent Bank contract, not a wallet you control.`,
-    );
-  }
-  return to;
+  return assertDestination(report, to);
 }
 
 /** Checks the destination and the fallback handler the plan relies on. */
-async function checkPlanTargets(ctx: Context, report: AccountReport, plan: Plan): Promise<void> {
-  if (plan.steps.some((s) => s.id.startsWith("set-fallback-handler"))) {
-    const code = await ctx.conn.client.getCode({ address: report.compatibilityFallbackHandler });
-    if (!code || code === "0x") {
-      throw new ExitToolError(
-        "missing_config",
-        `The CompatibilityFallbackHandler ${report.compatibilityFallbackHandler} has no code on ${report.chain.label}.`,
-        { hint: "Pass --fallback-handler <address> (a deployed Safe CompatibilityFallbackHandler)." },
-      );
-    }
-  }
+async function checkPlanTargets(ctx: Context, plan: Plan): Promise<void> {
   if (plan.destination) {
     const code = await ctx.conn.client.getCode({ address: plan.destination });
     if (code && code !== "0x") {
@@ -719,7 +700,7 @@ function printSignerOnly(
     "Then submit (a funded SENDER_PRIVATE_KEY or --sender-keystore pays the gas; or print the transactions to send yourself):",
   );
   printer.line(
-    `  agentbank-exit submit --plan-file ${written.planPath} ${file.payloads.map(() => "--signature 0x…").join(" ")} --execute`,
+    `  agentbank-exit submit --plan-file ${written.planPath} ${file.payloads.map(() => "--signature 0x…").join(" ")}${file.destination ? ` --to ${file.destination}` : ""} --execute`,
   );
   if (deferred.length > 0) {
     printer.line("");
@@ -802,6 +783,59 @@ async function finalizeSignedSteps(
   return out;
 }
 
+/** Simulates the final signed transactions, in one eth_simulateV1 block or one by one. */
+async function simulateSigned(
+  client: Connection["client"],
+  account: Address,
+  finals: { step: MaterializedStep; to: Address; data: Hex; value: bigint }[],
+): Promise<StepSimulation[]> {
+  try {
+    const [block] = await client.simulateBlocks({
+      blocks: [
+        {
+          calls: finals.map((f) => ({ account: SIMULATION_SENDER, to: f.to, data: f.data, value: f.value })),
+        },
+      ],
+      validation: false,
+    });
+    return (block?.calls ?? []).map((r, i) => ({
+      index: finals[i]!.step.index,
+      status: r.status,
+      gasUsed: r.gasUsed,
+      ...(r.status === "failure" ? { error: describeRevertData(r.data) } : {}),
+    }));
+  } catch (err) {
+    if (!isUnsupportedMethodError(err)) throw err;
+  }
+  const out: StepSimulation[] = [];
+  for (const f of finals) {
+    // Give the Safe the nonce this step will see (storage slot 5), so its signatures verify on their own.
+    const stateOverride = f.step.safeTx
+      ? [
+          {
+            address: account,
+            stateDiff: [
+              { slot: SAFE_NONCE_SLOT, value: pad(numberToHex(f.step.safeTx.nonce), { size: 32 }) },
+            ],
+          },
+        ]
+      : undefined;
+    try {
+      const gasUsed = await client.estimateGas({
+        account: SIMULATION_SENDER,
+        to: f.to,
+        data: f.data,
+        value: f.value,
+        ...(stateOverride ? { stateOverride } : {}),
+      });
+      out.push({ index: f.step.index, status: "success", gasUsed });
+    } catch (err) {
+      out.push({ index: f.step.index, status: "failure", error: describeRevertData(extractRevertData(err)) });
+    }
+  }
+  return out;
+}
+
 async function runSubmit(ctx: Context): Promise<number> {
   const { values, printer, conn } = ctx;
   const planPath = values["plan-file"];
@@ -819,57 +853,66 @@ async function runSubmit(ctx: Context): Promise<number> {
   const account = parseAddressOption("account", values.account ?? ctx.io.env.AGENTBANK_ACCOUNT);
   const { file, steps } = parsePlanFile(json, { chainId: conn.chain.id, ...(account ? { account } : {}) });
   const signatures = (values.signature ?? []) as Hex[];
-  const safeNonce = await conn.client.readContract({
-    address: file.account,
-    abi: safeAbi,
-    functionName: "nonce",
+
+  // The plan file is untrusted input: check every step against what this tool produces, using only
+  // the chain, the configured contracts and the destination the user confirms with --to.
+  const reportStub = await inspect(ctx, file.account, undefined, false);
+  const destination = parseAddressOption("to", values.to);
+  verifyPlanSteps(steps, {
+    account: file.account,
+    ...(destination ? { destination } : {}),
+    contracts: reportStub.contracts,
+    compatibilityFallbackHandler: reportStub.compatibilityFallbackHandler,
+    multiSendVerified: Boolean(reportStub.multiSendCallOnly),
   });
-  // Safe steps whose nonce is already used ran before (or were replaced): never resend them.
-  const done = steps.filter((s) => !s.skipped && s.safeTx !== undefined && s.safeTx.nonce < safeNonce);
-  for (const s of done) {
-    s.skipped = `already executed or replaced (Safe nonce ${s.safeTx!.nonce} is used)`;
+
+  // Safe steps whose nonce is used are skipped only if the Safe executed exactly this SafeTx.
+  const safeNonce = reportStub.safe.nonce;
+  const done: number[] = [];
+  for (const s of steps) {
+    if (s.skipped || !s.safeTx || s.safeTx.nonce >= safeNonce) continue;
+    const executedAt =
+      file.block !== undefined
+        ? await findExecutionSuccess(conn.client, file.account, s.safeTxHash!, BigInt(file.block))
+        : undefined;
+    if (executedAt === undefined) {
+      throw new ExitToolError(
+        "plan_mismatch",
+        `Step ${s.index} uses Safe nonce ${s.safeTx.nonce}, which another transaction has used: this plan is stale.`,
+        { hint: "Create a new plan with --signer-only and sign it again." },
+      );
+    }
+    s.skipped = `already executed in block ${executedAt}`;
+    done.push(s.index);
   }
   if (steps.every((s) => s.skipped)) {
-    printer.line(
-      `Nothing left to submit from ${planPath}: every step has already run (Safe nonce is ${safeNonce}).`,
-    );
+    printer.line(`Nothing left to submit from ${planPath}: every step has already been executed.`);
     printer.document({
       command: "submit",
       planFile: planPath,
       account: file.account,
       execution: [],
-      alreadyExecuted: done.map((s) => s.index),
+      alreadyExecuted: done,
     });
     return 0;
   }
   const finals = await finalizeSignedSteps(steps, file, signatures);
 
-  // Simulate exactly what will be sent, with the real signatures.
-  const [block] = await conn.client.simulateBlocks({
-    blocks: [
-      { calls: finals.map((f) => ({ account: SIMULATION_SENDER, to: f.to, data: f.data, value: f.value })) },
-    ],
-    validation: false,
-  });
-  const results = (block?.calls ?? []).map((r, i) => ({
-    index: finals[i]!.step.index,
-    status: r.status,
-    gasUsed: r.gasUsed,
-    ...(r.status === "failure" ? { error: describeRevertData(r.data) } : {}),
-  }));
+  // Simulate exactly what will be sent, with the real signatures (each step on its own, with the
+  // Safe nonce it will see, when the RPC has no eth_simulateV1).
+  const results = await simulateSigned(conn.client, file.account, finals);
   const sim: SimulationResult = {
-    ok: results.every((r) => r.status === "success"),
+    ok: results.length === finals.length && results.every((r) => r.status === "success"),
     method: "eth_simulateV1",
     steps,
     results,
-    gasTotal: results.reduce((a, r) => a + r.gasUsed, 0n),
+    gasTotal: results.reduce((a, r) => a + (r.gasUsed ?? 0n), 0n),
   };
-  const reportStub = await inspect(ctx, file.account, undefined, false);
   printer.line(
     renderSimulation(
       reportStub,
       sim,
-      `Signed plan ${planPath}: ${file.command} for ${file.account} on ${conn.chain.label} (Safe nonce now ${safeNonce})`,
+      `Signed plan ${planPath}: ${file.command} for ${file.account} on ${conn.chain.label} (Safe nonce now ${safeNonce}); step titles below are derived from the calldata, not taken from the file`,
     ).join("\n"),
   );
   for (const note of file.notes) printer.line(`  note: ${note}`);

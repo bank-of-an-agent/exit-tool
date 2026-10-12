@@ -125,12 +125,30 @@ export function simulatedSignatures(signers: readonly Address[]): Hex {
   return packSignatures(signers.map((signer) => ({ signer, kind: "contract" as const, data: "0x" })));
 }
 
-function isUnsupportedMethod(err: unknown): boolean {
-  const text =
-    err instanceof Error
-      ? `${err.message} ${String((err as { details?: unknown }).details ?? "")}`
-      : String(err);
-  return /eth_simulateV1|method not found|not supported|does not exist|unknown method|-32601/i.test(text);
+/**
+ * Whether an RPC error means "this node does not implement the method" (so a fallback is right),
+ * as opposed to any other failure (which must surface). Judged by JSON-RPC error codes and the
+ * node's own message only, never by viem's full message (which quotes the request).
+ */
+export function isUnsupportedMethodError(err: unknown): boolean {
+  let unsupported = false;
+  const visit = (e: unknown, depth: number): void => {
+    if (unsupported || depth > 12 || e === null || typeof e !== "object") return;
+    const code = (e as { code?: unknown }).code;
+    if (code === -32601 || code === -32004) unsupported = true;
+    const details = (e as { details?: unknown }).details;
+    if (
+      typeof details === "string" &&
+      /method not found|not supported|does not exist|not available|unknown method|unsupported method/i.test(
+        details,
+      )
+    ) {
+      unsupported = true;
+    }
+    visit((e as { cause?: unknown }).cause, depth + 1);
+  };
+  visit(err, 0);
+  return unsupported;
 }
 
 /** Reads used to resolve amounts, either live or projected through earlier simulated calls. */
@@ -139,16 +157,23 @@ interface Reader {
   ethBalance(holder: Address): Promise<bigint>;
 }
 
-function liveReader(client: PublicClient): Reader {
+function liveReader(client: PublicClient, blockNumber?: bigint): Reader {
+  const at = blockNumber !== undefined ? { blockNumber } : {};
   return {
-    call: async (to, data) => (await client.call({ to, data })).data ?? "0x",
-    ethBalance: (holder) => client.getBalance({ address: holder }),
+    call: async (to, data) => (await client.call({ to, data, ...at })).data ?? "0x",
+    ethBalance: (holder) => client.getBalance({ address: holder, ...at }),
   };
 }
 
-function projectedReader(client: PublicClient, prior: readonly SimCall[], overrides: StateOverride): Reader {
+function projectedReader(
+  client: PublicClient,
+  prior: readonly SimCall[],
+  overrides: StateOverride,
+  blockNumber: bigint,
+): Reader {
   const read = async (to: Address, data: Hex): Promise<Hex> => {
     const [block] = await client.simulateBlocks({
+      blockNumber,
       blocks: [{ calls: [...prior, { account: SIMULATION_SENDER, to, data }], stateOverrides: overrides }],
       validation: false,
     });
@@ -238,18 +263,22 @@ export async function materializeAndSimulate(
   const overrides = simulationOverrides(stubbed);
   const signatures = simulatedSignatures(options.simulatedSigners);
   const account = report.account;
+  // Every read and simulation runs on top of the same block (the one inspected), so amounts that
+  // depend on time (stream accrual) are consistent between the projection and the final simulation.
+  const baseBlock = report.block.number;
 
   let method: SimulationResult["method"] = "eth_simulateV1";
   let note: string | undefined;
   try {
     await client.simulateBlocks({
+      blockNumber: baseBlock,
       blocks: [
         { calls: [{ account: SIMULATION_SENDER, to: account, data: "0x" }], stateOverrides: overrides },
       ],
       validation: false,
     });
   } catch (err) {
-    if (!isUnsupportedMethod(err)) throw err;
+    if (!isUnsupportedMethodError(err)) throw err;
     method = "eth_call";
     note =
       "This RPC does not support eth_simulateV1: each step was simulated on its own against the current state, and amounts that depend on earlier steps are shown as of now. Execution re-checks every step right before sending it.";
@@ -264,8 +293,8 @@ export async function materializeAndSimulate(
   for (const [i, step] of plan.steps.entries()) {
     const reader =
       method === "eth_simulateV1" && prior.length > 0
-        ? projectedReader(client, prior, overrides)
-        : liveReader(client);
+        ? projectedReader(client, prior, overrides, baseBlock)
+        : liveReader(client, baseBlock);
     const amount = await resolveAmount(step.amount, reader);
     const base = {
       index: i + 1,
@@ -287,7 +316,7 @@ export async function materializeAndSimulate(
       const req = step.vaultSignature;
       let domain = domains.get(req.vaults.toLowerCase());
       if (!domain) {
-        domain = await readVaultDomain(client, req.vaults);
+        domain = await readVaultDomain(client, req.vaults, plan.chainId);
         domains.set(req.vaults.toLowerCase(), domain);
       }
       const nonce = vaultNonces.get(req.id.toString()) ?? 0n;
@@ -350,6 +379,7 @@ export async function materializeAndSimulate(
   if (method === "eth_simulateV1") {
     // Read balances before and after the steps, in the same simulated block.
     const [block] = await client.simulateBlocks({
+      blockNumber: baseBlock,
       blocks: [
         {
           calls: [...reads.map((r) => r.call), ...prior, ...reads.map((r) => r.call)],
@@ -392,6 +422,7 @@ export async function materializeAndSimulate(
           data: sim.data,
           value: sim.value,
           stateOverride: overrides,
+          blockNumber: baseBlock,
         });
         const gas = await client
           .estimateGas({
@@ -400,6 +431,7 @@ export async function materializeAndSimulate(
             data: sim.data,
             value: sim.value,
             stateOverride: overrides,
+            blockNumber: baseBlock,
           })
           .catch(() => undefined);
         results.push({ index: s.index, status: "success", ...(gas !== undefined ? { gasUsed: gas } : {}) });
@@ -422,6 +454,7 @@ export async function materializeAndSimulate(
       const before = prior.slice(0, active.indexOf(s));
       try {
         const [block] = await client.simulateBlocks({
+          blockNumber: baseBlock,
           blocks: [
             {
               calls: [...before, { account, to: s.call.to, data: s.call.data, value: s.call.value }],
@@ -439,6 +472,16 @@ export async function materializeAndSimulate(
     }
   }
 
+  // A step the RPC returned no result for was not simulated: never count it as a success.
+  for (const s of active) {
+    if (!results.some((r) => r.index === s.index)) {
+      results.push({
+        index: s.index,
+        status: "failure",
+        error: "the RPC returned no simulation result for this step",
+      });
+    }
+  }
   results.sort((a, b) => a.index - b.index);
   const gasTotal = results.reduce((acc, r) => acc + (r.gasUsed ?? 0n), 0n);
   return {

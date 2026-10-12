@@ -15,7 +15,6 @@ export interface AgentBankContracts {
 export interface Deployments {
   chainId?: number;
   usdc?: Address;
-  compatibilityFallbackHandler?: Address;
   contracts: AgentBankContracts;
   /** Earliest block of any Agent Bank contract: event scans never need to look further back. */
   fromBlock?: bigint;
@@ -23,7 +22,7 @@ export interface Deployments {
   mode?: string;
 }
 
-const KEYS: Record<string, keyof AgentBankContracts | "usdc" | "compatibilityFallbackHandler"> = {
+const KEYS: Record<string, keyof AgentBankContracts | "usdc"> = {
   agentescrow: "escrow",
   escrow: "escrow",
   paymentstreams: "streams",
@@ -37,8 +36,6 @@ const KEYS: Record<string, keyof AgentBankContracts | "usdc" | "compatibilityFal
   policyhook: "policyHook",
   usdc: "usdc",
   mockusdc: "usdc",
-  compatibilityfallbackhandler: "compatibilityFallbackHandler",
-  fallbackhandler: "compatibilityFallbackHandler",
 };
 
 const BLOCK_KEYS = ["blockNumber", "deployBlock", "deploymentBlock", "startBlock", "block"];
@@ -106,7 +103,6 @@ export function parseDeployments(json: unknown): Deployments {
         continue;
       }
       if (target === "usdc") out.usdc = address;
-      else if (target === "compatibilityFallbackHandler") out.compatibilityFallbackHandler = address;
       else out.contracts[target] = address;
     }
   }
@@ -121,9 +117,6 @@ export function mergeDeployments(...items: (Deployments | undefined)[]): Deploym
     if (!item) continue;
     if (item.chainId !== undefined) out.chainId = item.chainId;
     if (item.usdc !== undefined) out.usdc = item.usdc;
-    if (item.compatibilityFallbackHandler !== undefined) {
-      out.compatibilityFallbackHandler = item.compatibilityFallbackHandler;
-    }
     if (item.fromBlock !== undefined) out.fromBlock = item.fromBlock;
     if (item.mode !== undefined) out.mode = item.mode;
     for (const [k, v] of Object.entries(item.contracts) as [

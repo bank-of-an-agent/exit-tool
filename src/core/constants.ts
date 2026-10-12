@@ -9,6 +9,9 @@ export const SENTINEL: Address = "0x0000000000000000000000000000000000000001";
 /** Safe storage slot of the singleton (master copy) address in every SafeProxy. */
 export const SINGLETON_SLOT: Hex = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
+/** Safe v1.4.1 storage slot of `nonce` (after singleton, modules, owners, ownerCount, threshold). */
+export const SAFE_NONCE_SLOT: Hex = "0x0000000000000000000000000000000000000000000000000000000000000005";
+
 /** keccak256("fallback_manager.handler.address"): Safe FallbackManager storage slot. */
 export const FALLBACK_HANDLER_SLOT: Hex =
   "0x6c9a6c4a39284e37ed1cf53d337577d14212a4870fb976a4366c693b939918d5";
@@ -28,6 +31,14 @@ export const SAFE_V141 = {
   compatibilityFallbackHandler: "0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99",
   multiSendCallOnly: "0x9641d764fc13c8B624c04430C7356C1C7C8102e2",
 } as const satisfies Record<string, Address>;
+
+/**
+ * keccak256 of the CompatibilityFallbackHandler v1.4.1 runtime code (read on Base Sepolia; equals the
+ * `@safe-global/safe-deployments` code hash). The revoke only installs a handler with exactly this
+ * code: a fallback handler can answer ERC-1271 checks for the account, so it must never be configurable.
+ */
+export const COMPATIBILITY_FALLBACK_HANDLER_CODEHASH: Hex =
+  "0x7c6007a5d711cea8dfd5d91f5940ec29c7f200fe511eb1fc1397b367af3c42f9";
 
 /** Rhinestone Safe7579 adapter: the Safe module + fallback handler that runs ERC-7579 modules. */
 export const SAFE7579_ADAPTER: Address = "0x7579EE8307284F293B1927136486880611F20002";
