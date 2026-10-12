@@ -47,6 +47,20 @@ export function findAnvil(): { command: string; prefix: string[]; source: string
   return undefined;
 }
 
+const helpCache = new Map<string, string>();
+
+/** Whether the anvil found here accepts `flag` (newer releases add options older ones reject). */
+export function anvilSupports(flag: string): boolean {
+  const found = findAnvil();
+  if (!found) return false;
+  const key = `${found.command} ${found.prefix.join(" ")}`;
+  if (!helpCache.has(key)) {
+    const res = spawnSync(found.command, [...found.prefix, "--help"], { encoding: "utf8", timeout: 300_000 });
+    helpCache.set(key, `${res.stdout ?? ""}${res.stderr ?? ""}`);
+  }
+  return helpCache.get(key)!.includes(flag);
+}
+
 async function rpcReady(url: string): Promise<boolean> {
   try {
     const res = await fetch(url, {

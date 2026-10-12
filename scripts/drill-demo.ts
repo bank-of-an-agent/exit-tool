@@ -7,12 +7,13 @@
  *
  *   pnpm drill:demo [--port 8546]
  *
- * Needs anvil (Foundry) and the Agent Bank contracts built in ../contracts (forge build) or
- * AGENTBANK_CONTRACTS_OUT. Local chain only; the keys printed are Anvil's public development keys.
+ * Needs anvil (Foundry). The Agent Bank contracts come from the artifacts vendored in
+ * test/fixtures/agentbank-contracts, or from a Foundry build named by AGENTBANK_CONTRACTS_OUT. Local
+ * chain only; the keys printed are Anvil's public development keys.
  */
 import { writeFileSync } from "node:fs";
 import path from "node:path";
-import { DEV_KEYS, accounts } from "../test/integration/harness";
+import { CONTRACTS_SOURCE, DEV_KEYS, accounts } from "../test/integration/harness";
 import { DAY, DESTINATION, haveAgentBank, setupDrill, shutDown, travel } from "../test/integration/scenario";
 
 const portArg = process.argv.indexOf("--port");
@@ -20,7 +21,7 @@ const port = portArg > 0 ? Number(process.argv[portArg + 1]) : 8546;
 
 if (!haveAgentBank) {
   console.error(
-    "The Agent Bank contract artifacts were not found: run `forge build` in ../contracts or set AGENTBANK_CONTRACTS_OUT.",
+    `The Agent Bank contract artifacts were not found in ${CONTRACTS_SOURCE}: restore test/fixtures/agentbank-contracts (scripts/vendor-contracts.sh) or point AGENTBANK_CONTRACTS_OUT at a Foundry build.`,
   );
   process.exit(1);
 }

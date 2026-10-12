@@ -74,18 +74,36 @@ export const SAFE_ARTIFACTS = {
   testToken: safeArtifact("test/ERC20Token.sol/ERC20Token.json"),
 };
 
-/** Where Agent Bank Foundry artifacts are expected: $AGENTBANK_CONTRACTS_OUT or ../contracts/out. */
-export const CONTRACTS_OUT =
-  process.env.AGENTBANK_CONTRACTS_OUT || path.resolve(import.meta.dirname, "../../../contracts/out");
+/** What a deployment needs: the interface and the creation bytecode. */
+export type DeployableArtifact = Pick<Artifact, "abi" | "bytecode">;
 
-export function agentBankArtifact(name: string): Artifact | undefined {
-  const file = path.join(CONTRACTS_OUT, `${name}.sol`, `${name}.json`);
+/**
+ * The Agent Bank contract artifacts vendored by scripts/vendor-contracts.sh (ABI and creation
+ * bytecode of every contract the drill deploys; SOURCE records the contracts commit). The drill
+ * uses them unless $AGENTBANK_CONTRACTS_OUT names a Foundry out/ directory to use instead.
+ */
+export const VENDORED_CONTRACTS = path.resolve(import.meta.dirname, "../fixtures/agentbank-contracts");
+export const CONTRACTS_OUT = process.env.AGENTBANK_CONTRACTS_OUT || undefined;
+/** Where the Agent Bank artifacts come from, for messages. */
+export const CONTRACTS_SOURCE = CONTRACTS_OUT ?? VENDORED_CONTRACTS;
+
+/** The contracts commit the vendored artifacts were built from (undefined with AGENTBANK_CONTRACTS_OUT). */
+export function vendoredContractsCommit(): string | undefined {
+  if (CONTRACTS_OUT) return undefined;
+  const file = path.join(VENDORED_CONTRACTS, "SOURCE");
+  if (!existsSync(file)) return undefined;
+  return /^commit: ([0-9a-f]{40})$/m.exec(readFileSync(file, "utf8"))?.[1];
+}
+
+export function agentBankArtifact(name: string): DeployableArtifact | undefined {
+  const file = CONTRACTS_OUT
+    ? path.join(CONTRACTS_OUT, `${name}.sol`, `${name}.json`)
+    : path.join(VENDORED_CONTRACTS, `${name}.json`);
   if (!existsSync(file)) return undefined;
   const json = JSON.parse(readFileSync(file, "utf8"));
   const bytecode = json.bytecode?.object ?? json.bytecode;
-  const deployedBytecode = json.deployedBytecode?.object ?? json.deployedBytecode;
-  if (typeof bytecode !== "string" || bytecode.length < 4) return undefined;
-  return { abi: json.abi, bytecode: bytecode as Hex, deployedBytecode: deployedBytecode as Hex };
+  if (!Array.isArray(json.abi) || typeof bytecode !== "string" || bytecode.length < 4) return undefined;
+  return { abi: json.abi, bytecode: bytecode as Hex };
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -134,7 +152,7 @@ export async function send(
 export async function deploy(
   c: Clients,
   role: Role,
-  artifact: Artifact,
+  artifact: DeployableArtifact,
   args: readonly unknown[] = [],
 ): Promise<Address> {
   const hash = await c.wallet(role).deployContract({

@@ -1,8 +1,9 @@
 /**
  * The shutdown-drill scenario, shared by the integration test and `pnpm drill:demo`:
  * a local Anvil chain with the canonical Safe v1.4.1 contracts (byte-identical to Base Sepolia, at
- * the same addresses), Agent Bank's contracts and MockUSDC (from ../contracts/out), and an Agent
- * Bank-style account with escrows, streams, vaults and spend keys.
+ * the same addresses), Agent Bank's contracts and mocks (the artifacts vendored in
+ * test/fixtures/agentbank-contracts, or $AGENTBANK_CONTRACTS_OUT), and an Agent Bank-style account
+ * with escrows, streams, vaults, spend keys and treasury automation.
  */
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -36,6 +37,18 @@ import {
 } from "./harness";
 
 export const DAY = 86_400n;
+/** Every Agent Bank contract the drill deploys (what scripts/vendor-contracts.sh vendors). */
+export const AGENT_BANK_CONTRACTS = [
+  "AgentEscrow",
+  "PaymentStreams",
+  "TimeLockVaults",
+  "TopUpExecutor",
+  "SweepExecutor",
+  "AgentPolicyHook",
+  "MockUSDC",
+  "MockTreasuryFund",
+  "MockValidationRegistry",
+] as const;
 export const escrowArt = agentBankArtifact("AgentEscrow");
 export const streamsArt = agentBankArtifact("PaymentStreams");
 export const vaultsArt = agentBankArtifact("TimeLockVaults");
@@ -43,9 +56,13 @@ export const usdcArt = agentBankArtifact("MockUSDC");
 export const topUpArt = agentBankArtifact("TopUpExecutor");
 export const sweepArt = agentBankArtifact("SweepExecutor");
 export const fundArt = agentBankArtifact("MockTreasuryFund");
+export const policyHookArt = agentBankArtifact("AgentPolicyHook");
+export const registryArt = agentBankArtifact("MockValidationRegistry");
+/** Contracts the drill would deploy but whose artifacts were not found. */
+export const missingContracts = AGENT_BANK_CONTRACTS.filter((name) => !agentBankArtifact(name));
 /** Treasury executors and the mock fund are optional parts of the scenario. */
 export const haveExecutors = Boolean(topUpArt && sweepArt && fundArt);
-/** Whether ../contracts/out (or $AGENTBANK_CONTRACTS_OUT) has the Agent Bank artifacts the drill needs. */
+/** Whether the Agent Bank artifacts the drill needs at minimum were found. */
 export const haveAgentBank = Boolean(escrowArt && streamsArt && vaultsArt && usdcArt);
 
 /** A fresh address nobody controls: the owner's cold wallet. */
@@ -66,6 +83,8 @@ export interface Drill {
   ab?: {
     /** Treasury executors installed on the account, and the sweep fund whose shares it holds. */
     executors?: { topUp: Address; sweep: Address; fund: Address; fundAbi: Abi; shares: bigint };
+    /** The AgentPolicyHook installed on the account (it limits agents, never the owner). */
+    policyHook?: Address;
     escrow: Address;
     streams: Address;
     vaults: Address;
@@ -77,6 +96,7 @@ export interface Drill {
       escrowB: bigint; // expires after 30 days: pending
       escrowC: bigint; // disputed by the payee: refundable after expiry + 30 days
       escrowD: bigint; // already released to the payee: nothing to recover
+      escrowE?: bigint; // incoming, approved by its ERC-8004 validator: anyone may release it to the account
       s1: bigint; // per-second stream the account pays
       s2: bigint; // daily stream to a payee USDC later freezes
       s3: bigint; // incoming stream (another agent pays the account)
@@ -182,7 +202,9 @@ export async function setupDrill(options: { anvilArgs?: string[]; port?: number 
 
   // Agent Bank contracts with a pause guardian (the bank's last act before shutting down is to pause them).
   const guardian = accounts.guardian.address;
-  const escrow = await deploy(c, "deployer", escrowArt!, [guardian, ZERO_ADDRESS]);
+  // An ERC-8004 validation registry, so escrows can be released by a validator's approval.
+  const registry = registryArt ? await deploy(c, "deployer", registryArt) : undefined;
+  const escrow = await deploy(c, "deployer", escrowArt!, [guardian, registry ?? ZERO_ADDRESS]);
   const streams = await deploy(c, "deployer", streamsArt!, [guardian]);
   const vaults = await deploy(c, "deployer", vaultsArt!, [guardian]);
   const topUp = haveExecutors ? await deploy(c, "deployer", topUpArt!) : undefined;
@@ -190,6 +212,7 @@ export async function setupDrill(options: { anvilArgs?: string[]; port?: number 
   const fund = haveExecutors
     ? await deploy(c, "deployer", fundArt!, [token, accounts.deployer.address])
     : undefined;
+  const policyHook = policyHookArt ? await deploy(c, "deployer", policyHookArt) : undefined;
   writeFileSync(
     deploymentsFile,
     JSON.stringify(
@@ -200,8 +223,13 @@ export async function setupDrill(options: { anvilArgs?: string[]; port?: number 
           PaymentStreams: streams,
           TimeLockVaults: vaults,
           ...(topUp && sweep ? { TopUpExecutor: topUp, SweepExecutor: sweep } : {}),
+          ...(policyHook ? { AgentPolicyHook: policyHook } : {}),
         },
-        dependencies: { USDC: token, ...(fund ? { MockTreasuryFund: fund } : {}) },
+        dependencies: {
+          USDC: token,
+          ...(fund ? { MockTreasuryFund: fund } : {}),
+          ...(registry ? { MockValidationRegistry: registry } : {}),
+        },
         mode: "broadcast",
       },
       null,
@@ -240,6 +268,51 @@ export async function setupDrill(options: { anvilArgs?: string[]; port?: number 
   await send(c, "payee", escrow, call(escrowAbi, "dispute", [escrowC]));
   const escrowD = await lock(accounts.payee.address, u(10), t0 + 3_600n, ZERO_ADDRESS);
   await agent(escrow, call(escrowAbi, "release", [escrowD]));
+
+  // Another agent pays the account through an escrow released by its ERC-8004 validator's approval:
+  // once the validator approves, anyone may release it, and only to the account.
+  let escrowE: bigint | undefined;
+  if (registry) {
+    const validator = accounts.relayer.address;
+    const requestHash = keccak256(toHex("agentbank-exit drill: validated delivery"));
+    await send(
+      c,
+      "otherAgent",
+      registry,
+      call(registryArt!.abi, "validationRequest", [validator, 1n, "drill://request", requestHash]),
+    );
+    await send(c, "deployer", token, call(usdcAbi, "mint", [accounts.otherAgent.address, u(15)]));
+    await send(c, "otherAgent", token, call(usdcAbi, "approve", [escrow, u(15)]));
+    await send(
+      c,
+      "otherAgent",
+      escrow,
+      call(escrowAbi, "lock", [
+        token,
+        safe,
+        u(15),
+        t0 + 30n * DAY,
+        ZERO_ADDRESS,
+        validator,
+        requestHash,
+        80,
+        keccak256(toHex("terms E")),
+      ]),
+    );
+    escrowE = await read<bigint>(result, escrow, escrowAbi, "escrowCount");
+    await send(
+      c,
+      "relayer",
+      registry,
+      call(registryArt!.abi, "validationResponse", [
+        requestHash,
+        100,
+        "drill://approved",
+        keccak256(toHex("approved")),
+        "delivery",
+      ]),
+    );
+  }
 
   const stream = async (payee: Address, deposit: bigint, rate: bigint, interval: bigint) => {
     await agent(token, call(usdcAbi, "approve", [streams, deposit]));
@@ -302,16 +375,31 @@ export async function setupDrill(options: { anvilArgs?: string[]; port?: number 
     const shares = await read<bigint>(result, fund, fundArt!.abi, "balanceOf", [safe]);
     executors = { topUp, sweep, fund, fundAbi: fundArt!.abi, shares };
   }
+  // Agent Bank's policy hook, installed the same way: it limits agent operations, not the owner's.
+  if (policyHook) await agent(policyHook, call(policyHookArt!.abi, "onInstall", ["0x"]));
 
   result.ab = {
     ...(executors ? { executors } : {}),
+    ...(policyHook ? { policyHook } : {}),
     escrow,
     streams,
     vaults,
     escrowAbi,
     streamsAbi,
     vaultsAbi,
-    ids: { escrowA, escrowB, escrowC, escrowD, s1, s2, s3, v1, v2, v3 },
+    ids: {
+      escrowA,
+      escrowB,
+      escrowC,
+      escrowD,
+      ...(escrowE !== undefined ? { escrowE } : {}),
+      s1,
+      s2,
+      s3,
+      v1,
+      v2,
+      v3,
+    },
   };
   return result;
 }

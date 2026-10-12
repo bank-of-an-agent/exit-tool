@@ -2,15 +2,16 @@
  * Phase 5 gate evidence: "Owner exit tool published and tested against a simulated bank shutdown."
  *
  * A local Anvil chain gets the canonical Safe v1.4.1 contracts (byte-identical to Base Sepolia, at
- * the same addresses), Agent Bank's own contracts and MockUSDC (from ../contracts/out), and an
- * Agent Bank-style account: a 1-of-1 Safe owned by a test key, with the Safe7579 adapter address
- * as module and fallback handler, a second module standing in for the bank's executor powers, a
- * transaction guard, funds, escrows, streams, vaults and agent spend keys. Then Agent Bank "shuts
+ * the same addresses), Agent Bank's own contracts and mocks (the artifacts vendored in
+ * test/fixtures/agentbank-contracts, or $AGENTBANK_CONTRACTS_OUT), and an Agent Bank-style account:
+ * a 1-of-1 Safe owned by a test key, with the Safe7579 adapter address as module and fallback
+ * handler, a second module standing in for the bank's executor powers, a transaction guard, funds,
+ * escrows, streams, vaults, agent spend keys and treasury automation. Then Agent Bank "shuts
  * down": its pause guardian pauses every contract, USDC freezes a counterparty, and no API,
  * co-signer, bundler or indexer exists. The owner runs `agentbank-exit` with only the RPC URL and
  * the owner key, and every recoverable unit must reach the owner's destination.
  */
-import { mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
@@ -20,13 +21,25 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { SAFE_V141 } from "../../src/core/constants";
 import { agentBankAbiSource } from "../../src/core/abis/index";
 import { findAnvil } from "./anvil";
-import { accounts, CONTRACTS_OUT, createSafe, ownerExec, runCli, SAFE_ARTIFACTS, send } from "./harness";
+import {
+  accounts,
+  agentBankArtifact,
+  CONTRACTS_OUT,
+  CONTRACTS_SOURCE,
+  createSafe,
+  ownerExec,
+  runCli,
+  SAFE_ARTIFACTS,
+  send,
+  vendoredContractsCommit,
+} from "./harness";
 import {
   call,
   DAY,
   DESTINATION,
   escrowArt,
   haveAgentBank,
+  missingContracts,
   read as readWith,
   setupDrill,
   shutDown as shutDownWith,
@@ -40,14 +53,23 @@ const anvilAvailable = findAnvil() !== undefined;
 if (!anvilAvailable) {
   console.warn("shutdown drill SKIPPED: anvil not found (install Foundry, set ANVIL_BIN, or provide nix).");
 }
-if (anvilAvailable && !haveAgentBank) {
+if (anvilAvailable && missingContracts.length > 0) {
   const message =
-    `Agent Bank artifacts not found in ${CONTRACTS_OUT} (AgentEscrow, PaymentStreams, TimeLockVaults, MockUSDC): ` +
-    "the escrow/stream/vault parts of the shutdown drill are SKIPPED and a plain ERC-20 stands in for USDC. " +
-    "Run `forge build` in the contracts repository or set AGENTBANK_CONTRACTS_OUT.";
+    `Agent Bank artifacts missing from ${CONTRACTS_SOURCE}: ${missingContracts.join(", ")}. ` +
+    (haveAgentBank
+      ? "The parts of the shutdown drill that need them are SKIPPED. "
+      : "The escrow/stream/vault parts of the shutdown drill are SKIPPED and a plain ERC-20 stands in for USDC. ") +
+    (CONTRACTS_OUT
+      ? "Rebuild the contracts (forge build) or unset AGENTBANK_CONTRACTS_OUT to use the vendored artifacts."
+      : "Restore test/fixtures/agentbank-contracts (scripts/vendor-contracts.sh).");
+  // CI sets REQUIRE_AGENTBANK_CONTRACTS=1: the drill must never silently skip any part.
   if (process.env.REQUIRE_AGENTBANK_CONTRACTS === "1") throw new Error(message);
   console.warn(message);
 }
+/** Which Agent Bank build the drill ran against, for its summary. */
+const contractsUsed = CONTRACTS_OUT
+  ? `Agent Bank contracts from AGENTBANK_CONTRACTS_OUT=${CONTRACTS_OUT}`
+  : `vendored Agent Bank contract artifacts (contracts commit ${vendoredContractsCommit()?.slice(0, 7) ?? "unknown"})`;
 
 let drill: Drill;
 /** Incoming stream 3: what phase 1 collected (phase 2 must collect exactly the rest). */
@@ -109,7 +131,20 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
 
   afterAll(async () => {
     await drill?.anvil.stop();
-    if (summary.length > 0) console.log(["", "Shutdown drill summary", ...summary].join("\n"));
+    if (summary.length === 0) return;
+    console.log(["", "Shutdown drill summary", ...summary].join("\n"));
+    // Gate evidence: next to the CLI transcripts, and on the GitHub job summary page.
+    const dir = process.env.DRILL_TRANSCRIPT_DIR;
+    if (dir) {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(path.join(dir, "00-summary.txt"), `${summary.join("\n")}\n`);
+    }
+    if (process.env.GITHUB_STEP_SUMMARY) {
+      appendFileSync(
+        process.env.GITHUB_STEP_SUMMARY,
+        `### Shutdown drill\n\n${summary.map((line) => `- ${line}`).join("\n")}\n\n`,
+      );
+    }
   });
 
   it("deploys byte-identical canonical Safe v1.4.1 contracts", async () => {
@@ -127,17 +162,17 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
     }
   });
 
-  it.skipIf(!haveAgentBank)("vendored ABIs match the contracts build used for the drill", () => {
-    for (const [name, art] of [
-      ["AgentEscrow", escrowArt],
-      ["PaymentStreams", streamsArt],
-      ["TimeLockVaults", vaultsArt],
-    ] as const) {
-      const vendored = (agentBankAbiSource.artifacts as Record<string, { abiSha256: string }>)[name]!
-        .abiSha256;
-      const actual = createHashHex(JSON.stringify(art!.abi));
-      expect(actual, `${name} ABI drifted: run scripts/sync-abis.sh`).toBe(vendored);
+  it.skipIf(!haveAgentBank)("the exit tool's ABIs match the contracts the drill deploys", () => {
+    summary.push(`contracts: ${contractsUsed}`);
+    const artifacts = agentBankAbiSource.artifacts as Record<string, { abiSha256: string }>;
+    for (const name of Object.keys(artifacts)) {
+      const art = agentBankArtifact(name);
+      if (!art) continue; // reported (and fatal with REQUIRE_AGENTBANK_CONTRACTS=1) above
+      expect(createHashHex(JSON.stringify(art.abi)), `${name} ABI drifted: run scripts/sync-abis.sh`).toBe(
+        artifacts[name]!.abiSha256,
+      );
     }
+    expect([escrowArt, streamsArt, vaultsArt].every(Boolean)).toBe(true);
   });
 
   it.skipIf(!haveAgentBank)("inspect finds every position and reports what is recoverable", async () => {
@@ -153,9 +188,21 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
     const report = run.json!.report as Record<string, unknown>;
     const ids = drill.ab!.ids;
     const escrows = report.escrows as { id: string; role: string; status: string; refundableNow: boolean }[];
-    expect(escrows.map((e) => e.id).sort()).toEqual(
-      [ids.escrowA, ids.escrowB, ids.escrowC, ids.escrowD].map(String).sort(),
-    );
+    const escrowIds = [
+      ids.escrowA,
+      ids.escrowB,
+      ids.escrowC,
+      ids.escrowD,
+      ...(ids.escrowE ? [ids.escrowE] : []),
+    ];
+    expect(escrows.map((e) => e.id).sort()).toEqual(escrowIds.map(String).sort());
+    if (ids.escrowE) {
+      // Incoming and approved by its validator: anyone may release it to the account.
+      const incoming = (escrows as { id: string; role: string; releasableNow?: boolean }[]).find(
+        (e) => e.id === String(ids.escrowE),
+      )!;
+      expect(incoming).toMatchObject({ role: "payee", releasableNow: true });
+    }
     expect(escrows.find((e) => e.id === String(ids.escrowA))!.refundableNow).toBe(true);
     expect(escrows.find((e) => e.id === String(ids.escrowB))!.refundableNow).toBe(false);
     expect(escrows.find((e) => e.id === String(ids.escrowC))!.status).toBe("Disputed");
@@ -179,6 +226,7 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
       // Treasury automation is reported (and goes away with the adapter); fund shares are found.
       const codes = (report.findings as { code: string }[]).map((f) => f.code);
       expect(codes).toEqual(expect.arrayContaining(["topup_executor", "sweep_executor"]));
+      if (drill.ab!.policyHook) expect(codes).toContain("policy_hook");
       const fundShares = report.fundShares as { fund: { address: string }; balance: string };
       expect(getAddress(fundShares.fund.address)).toBe(executors.fund);
       expect(fundShares.balance).toBe(String(executors.shares));
@@ -189,6 +237,7 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
         "balance",
         "balance",
         "escrow_refund",
+        ...(ids.escrowE ? ["escrow_release"] : []),
         "stream_cancel",
         "stream_cancel",
         "stream_settle",
@@ -217,10 +266,11 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
       discovery: { positions: { method: string } };
     };
     expect(er.discovery.positions.method).toBe("enumeration");
-    expect([er.escrows.length, er.streams.length, er.vaults.length]).toEqual([4, 3, 3]);
+    expect([er.escrows.length, er.streams.length, er.vaults.length]).toEqual([escrowIds.length, 3, 3]);
     summary.push(
-      `inspect: 4 escrows, 3 streams, 3 vaults, 2 spend keys found from events and by enumeration; only ${drill.anvil.rpcUrl} contacted` +
-        (executors ? "; TopUpExecutor and SweepExecutor installs reported, treasury-fund shares found" : ""),
+      `inspect: ${escrowIds.length} escrows (${ids.escrowE ? "one incoming, released by its validator's approval" : "all paid by the account"}), 3 streams, 3 vaults, 2 spend keys found from events and by enumeration; only ${drill.anvil.rpcUrl} contacted` +
+        (executors ? "; TopUpExecutor and SweepExecutor installs reported, treasury-fund shares found" : "") +
+        (drill.ab!.policyHook ? "; AgentPolicyHook install reported" : ""),
     );
   });
 
@@ -282,7 +332,11 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
           discovery: { positions: { method: string } };
         };
         expect(r2.discovery.positions.method).toBe("enumeration");
-        expect([r2.escrows.length, r2.streams.length, r2.vaults.length]).toEqual([4, 3, 3]);
+        expect([r2.escrows.length, r2.streams.length, r2.vaults.length]).toEqual([
+          drill.ab!.ids.escrowE ? 5 : 4,
+          3,
+          3,
+        ]);
         // Without eth_simulateV1 every step is still simulated (each against the current state).
         const dry = await runCli(["exit", ...base, "--to", DESTINATION, "--json"]);
         expect(dry.code, dry.stderr + dry.stdout).toBe(0);
@@ -396,7 +450,8 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
       usdc(25) - // escrow C: disputed, refundable after expiry + 30 days
       usdc(40) + // vault 3: locked, owned by another key
       settledToAccount + // incoming stream 3
-      usdc(25); // spend-key float pulled back with its allowance
+      usdc(25) + // spend-key float pulled back with its allowance
+      (ab.ids.escrowE ? usdc(15) : 0n); // incoming escrow E, released by its validator's approval
     expect(await balanceOf(DESTINATION)).toBe(expected);
     settledBeforePhase2 = settledToAccount;
     expect(await read<bigint>(drill.usdc, drill.usdcAbi, "balanceOf", [accounts.spendKey.address])).toBe(0n);

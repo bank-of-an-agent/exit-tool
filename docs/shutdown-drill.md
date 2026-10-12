@@ -8,15 +8,16 @@ must never stop an owner from getting their money out.
 ## Result
 
 **Passed.** Run on 2026-10-11 with `@agentbank/exit` 0.1.0, Anvil 1.8.4 and the final Agent Bank
-contracts at commit `c758b66` (every source hash recorded in the build artifacts matches it). All 11
-drill tests passed in about 9 seconds.
+contracts at commit `c758b66`: the artifacts vendored in `test/fixtures/agentbank-contracts/`, whose
+recorded source hashes all matched that commit when they were vendored. The same run against a fresh
+build (`AGENTBANK_CONTRACTS_OUT`) also passed. All 11 drill tests passed in about 10 seconds.
 
 | Check                    | Result                                                                                                                                                                                                                                                                          |
 | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Positions found          | 4 escrows, 3 streams, 3 vaults and 2 spend keys, found both from contract events and by enumerating the contracts                                                                                                                                                               |
+| Positions found          | 5 escrows (one incoming, approved by its ERC-8004 validator), 3 streams, 3 vaults and 2 spend keys, found both from contract events and by enumerating the contracts                                                                                                            |
 | Network access           | The CLI contacted only the RPC URL, with no Agent Bank API, co-signer, bundler, paymaster or indexer (asserted on the inspect, dry-run and exit runs)                                                                                                                           |
-| Dry run                  | 11 steps simulated in one `eth_simulateV1` block without the owner key; chain state unchanged afterwards                                                                                                                                                                        |
-| Exit, phase 1            | 12 transactions sent with the owner key alone. The destination received 9,793.59 USDC, 2 ETH and all the treasury-fund shares. The account ends empty with no modules, no guard, and the plain fallback handler. The bank's module can no longer move funds                     |
+| Dry run                  | 12 steps simulated in one `eth_simulateV1` block without the owner key; chain state unchanged afterwards                                                                                                                                                                        |
+| Exit, phase 1            | 13 transactions sent with the owner key alone. The destination received 9,808.59 USDC, 2 ETH and all the treasury-fund shares. The account ends empty with no modules, no guard, and the plain fallback handler. The bank's module can no longer move funds                     |
 | Exit, phase 2 (+31 days) | The owner used a hardware-wallet flow (`--signer-only`, then `submit` through an unrelated relayer key) and recovered 128.59 more USDC. The escrow and vault contracts hold nothing of the account. The streams contract holds only the 20 USDC owed to the frozen payee        |
 | Other paths              | Hardware-wallet `EarlyWithdrawal` and `SafeTx` signatures; a 2-of-3 Safe (one signature refused, two accepted in any order); encrypted keystore (wrong passphrase refused, key never printed); a restrictive RPC with no `eth_simulateV1` and `eth_getLogs` capped at 10 blocks |
 
@@ -29,19 +30,31 @@ float that has no allowance to the account.
 
 ```sh
 pnpm install
-pnpm test:integration          # the drill (needs anvil; reads ../contracts/out)
+pnpm test:integration          # the drill (needs anvil)
 pnpm drill:demo                # the same scenario on a long-running Anvil, to try the CLI and web page by hand
 ```
 
 The drill needs:
 
 - `anvil`, found through `$ANVIL_BIN`, then `PATH`, then `nix shell nixpkgs#foundry -c anvil`.
-- The Agent Bank Foundry artifacts, from `../contracts/out` or `$AGENTBANK_CONTRACTS_OUT`.
+- The Agent Bank contracts. By default the drill deploys the artifacts vendored in
+  `test/fixtures/agentbank-contracts/`: the ABI and creation bytecode of the nine contracts it
+  deploys (AgentEscrow, PaymentStreams, TimeLockVaults, TopUpExecutor, SweepExecutor,
+  AgentPolicyHook, MockUSDC, MockTreasuryFund and MockValidationRegistry). Their `SOURCE` file
+  records the contracts commit, the compiler settings and a checksum of each file. Set
+  `AGENTBANK_CONTRACTS_OUT` to a Foundry `out/` directory to deploy another build instead.
 
-If the artifacts are missing, the escrow, stream and vault parts are skipped with a clear message,
-and a plain ERC-20 stands in for USDC. Set `REQUIRE_AGENTBANK_CONTRACTS=1` to turn that skip into a
-failure. In CI, the `Shutdown drill (Anvil)` job checks out and builds the contracts repository
-when it can. Run it through `workflow_dispatch` with `require_contracts` to get gate evidence.
+`scripts/vendor-contracts.sh` refreshes the vendored artifacts from `../contracts/out` (or
+`AGENTBANK_CONTRACTS_OUT`). It refuses artifacts that were not built from the sources checked out,
+and a checkout with uncommitted source changes, so the recorded commit is always the one built. A
+unit test checks the checksums, and that the artifacts come from the same commit as the ABIs the
+tool ships (`scripts/sync-abis.sh`).
+
+If artifacts are missing, the parts of the drill that need them are skipped with a clear message.
+`REQUIRE_AGENTBANK_CONTRACTS=1` turns that into a failure. CI always sets it: the `Shutdown drill
+(Anvil)` job runs the full drill from the vendored artifacts, needs no access to the contracts
+repository, and keeps the drill summary and CLI transcripts as the `shutdown-drill` artifact and on
+the job summary page.
 
 ## The scenario
 
@@ -55,7 +68,8 @@ Agent Bank account:
   address is both a Safe module and the fallback handler. A second module, an EOA, stands in for the
   bank's execution powers: the drill runs every agent action through it, the way the adapter runs
   agent sessions. A `DebugTransactionGuard` is set as the transaction guard.
-- **Funds and activity.** 2 ETH and 10,000 MockUSDC, then agent activity:
+- **Funds and activity.** 2 ETH and 10,000 MockUSDC, then agent activity. AgentEscrow is deployed
+  with a MockValidationRegistry (ERC-8004 validation requests and responses):
 
 | Position            | Setup                                                                                  | State when the bank shuts down (day 2)    |
 | ------------------- | -------------------------------------------------------------------------------------- | ----------------------------------------- |
@@ -63,6 +77,7 @@ Agent Bank account:
 | Escrow 2            | 50 USDC, expires after 30 days                                                         | locked                                    |
 | Escrow 3            | 25 USDC with an arbiter, disputed by the payee                                         | disputed: refundable 30 days after expiry |
 | Escrow 4            | 10 USDC, released to the payee                                                         | closed (the payee's money)                |
+| Escrow 5            | incoming: another agent pays 15 USDC, released by an ERC-8004 validator's approval     | approved: anyone can release it to you    |
 | Stream 1            | 1,000 USDC at 0.001 USDC/s                                                             | ~172.8 USDC earned by the payee           |
 | Stream 2            | 200 USDC at 10 USDC/day to a payee that USDC later freezes                             | 20 USDC earned                            |
 | Stream 3            | incoming: another agent streams 100 USDC to the account                                | ~86.4 USDC owed to the account            |
@@ -72,6 +87,7 @@ Agent Bank account:
 | Spend key 1         | 25 USDC float, permit-style allowance to the account                                   | recoverable                               |
 | Spend key 2         | 5 USDC float, no allowance                                                             | not recoverable by the owner              |
 | Treasury automation | TopUpExecutor and SweepExecutor installed; 60 USDC deposited into a mock treasury fund | fund shares held by the account           |
+| Policy hook         | AgentPolicyHook installed                                                              | limits agents, never the owner's path     |
 
 **The shutdown.** Two days pass. Agent Bank's pause guardian pauses AgentEscrow, PaymentStreams
 and TimeLockVaults, which stops inflows only. USDC freezes the payee of stream 2. No API,
@@ -84,10 +100,11 @@ The owner runs `agentbank-exit` with the RPC URL, the account, the deployments f
 key.
 
 1. `inspect` reports the Safe's configuration, every position, and the findings: the two modules,
-   the 7579 fallback, the guard, the executors, and the vault owned by another key. It then splits
+   the 7579 fallback, the guard, the executors, the policy hook, and the vault owned by another
+   key. It then splits
    what can be recovered now from what cannot yet. It does this once from events and once by
    enumeration.
-2. `exit --to <destination>` with no key is a dry run. It prints 11 steps, each with its call,
+2. `exit --to <destination>` with no key is a dry run. It prints 12 steps, each with its call,
    calldata, SafeTx nonce and hash, and simulates all of them in one block. It also prints the
    balance changes and the gas the owner's key will pay.
 3. `exit … --execute --yes` with the owner key sends these steps, each checked with `eth_call`
@@ -100,7 +117,8 @@ key.
       removals.
    3. Cancel streams 1 and 2. Stream 2's payee is frozen, so the payee's share is deferred, but the
       refund to the account still goes through.
-   4. Refund escrow 1. Settle the incoming stream 3.
+   4. Refund escrow 1. Release the incoming escrow 5, which its validator approved (a public call
+      that can only pay the account). Settle the incoming stream 3.
    5. Return vault 1. Early-withdraw vault 2, using an EIP-712 `EarlyWithdrawal` signed by the owner
       key.
    6. Pull spend key 1's float back with `transferFrom`.
@@ -113,7 +131,8 @@ key.
 
 The drill asserts conservation exactly. The destination's USDC equals what was minted to the
 account, minus what payees earned or were paid, minus the positions still locked, plus what the
-incoming stream paid, plus the spend-key float. Stream amounts come from the transaction receipts.
+incoming stream paid, plus the incoming escrow, plus the spend-key float. Stream amounts come from
+the transaction receipts.
 
 Output of the dry run (abridged):
 
@@ -123,18 +142,20 @@ Output of the dry run (abridged):
  3. Cancel stream #1 to 0x90F7…b906
  4. Cancel stream #2 to 0x15d3…6A65
  5. Refund escrow #1 (expired) to the account
- 6. Collect what incoming stream #3 owes the account
- 7. Return unlocked vault #1 to the account
- 8. Early-withdraw locked vault #2 to the account (owner-signed)
- 9. Pull USDC float of spend key 0x9965…A4dc back into the account
-10. Withdraw all USDC to 0x1310…41AA
-11. Withdraw all ETH to 0x1310…41AA
+ 6. Release incoming escrow #5 (validator approved) to the account
+ 7. Collect what incoming stream #3 owes the account
+ 8. Return unlocked vault #1 to the account
+ 9. Early-withdraw locked vault #2 to the account (owner-signed)
+10. Pull USDC float of spend key 0x9965…A4dc back into the account
+11. Withdraw all USDC to 0x1310…41AA
+12. Withdraw all ETH to 0x1310…41AA
 Simulated result: the account goes from 7775 USDC → 0 USDC; 2 ETH → 0 ETH
-                  the destination receives +9793.5935 USDC, +2 ETH
+                  the destination receives +9808.5925 USDC, +2 ETH
 ```
 
-The web page (`web/index.html`) was driven through the same scenario in a browser, using a test
-wallet that forwards to Anvil (a copy of the page with a relaxed CSP so the shim could reach Anvil).
+The web page (`web/index.html`) was driven through this scenario in a browser, before escrow 5 and
+the policy hook were added to it, using a test wallet that forwards to Anvil (a copy of the page
+with a relaxed CSP so the shim could reach Anvil).
 It ran inspect, which showed the executor findings, and previewed the 11-step exit. It then sent all
 11 transactions: the wallet was asked for 8 typed-data signatures (7 SafeTxs and 1
 `EarlyWithdrawal`) and 11 transactions. The account ended empty with no modules. The unmodified page
@@ -149,8 +170,11 @@ accepted the signature and simulated the resulting transaction.
 ## Base Sepolia fork check
 
 An opt-in suite, `RUN_FORK_TESTS=1 pnpm test:integration test/integration/base-sepolia-fork.test.ts`
-(or the `base-sepolia-fork` CI job), runs the tool against a local Anvil fork of Base Sepolia at
-block 48,000,000. Nothing is sent to Base Sepolia itself. On the fork it meets the real deployed
+(or the `base-sepolia-fork` CI job, started by hand), runs the tool against a local Anvil fork of
+Base Sepolia at block 48,000,000. Nothing is sent to Base Sepolia itself, and only Anvil development
+keys sign. It uses the public RPC unless `BASE_SEPOLIA_RPC_URL` is set. It checks first that the RPC
+answers, serves Base Sepolia and the fork block's state; if not, the suite is skipped with a warning
+(also on the GitHub job summary) instead of failing. On the fork it meets the real deployed
 contracts: Safe v1.4.1, the Safe7579 adapter, the canonical MultiSendCallOnly, Circle's FiatToken
 USDC (minted through the master-minter path), Candide's SocialRecoveryModule (72 h) and Rhinestone's
 OwnableValidator (module release V1).

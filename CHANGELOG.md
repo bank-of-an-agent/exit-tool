@@ -47,4 +47,9 @@ All notable changes to `@agentbank/exit` are documented here. The format follows
 - `web/index.html`: a single static page with the same inspect, withdraw and exit flow through an
   injected wallet, with a strict Content-Security-Policy (`connect-src 'none'`).
 - Shutdown drill on Anvil (`pnpm test:integration`), the Phase 5 gate evidence described in
-  `docs/shutdown-drill.md`.
+  `docs/shutdown-drill.md`. It deploys the Agent Bank contract artifacts vendored in
+  `test/fixtures/agentbank-contracts/` (refreshed with `scripts/vendor-contracts.sh`; `SOURCE`
+  records the contracts commit), so CI runs it in full without access to the contracts repository,
+  and it fails instead of skipping when an artifact is missing (`REQUIRE_AGENTBANK_CONTRACTS=1`).
+- Opt-in Base Sepolia fork tests against the real Safe7579 adapter, recovery module, OwnableValidator
+  and USDC. They skip with a warning when the RPC cannot back the fork.

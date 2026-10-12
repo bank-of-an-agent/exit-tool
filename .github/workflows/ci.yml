@@ -6,12 +6,8 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
-      require_contracts:
-        description: "Fail (instead of skipping) the Agent Bank parts of the drill when the contracts cannot be built"
-        type: boolean
-        default: false
       run_fork_tests:
-        description: "Also run the Base Sepolia fork tests (real Safe7579, recovery module and USDC; needs network)"
+        description: "Also run the Base Sepolia fork tests (a local Anvil fork of the public Base Sepolia RPC; nothing is sent to Base Sepolia)"
         type: boolean
         default: false
 
@@ -67,36 +63,28 @@ jobs:
         with:
           version: v1.8.4
       - run: pnpm install --frozen-lockfile
-      # The drill deploys the real Agent Bank contracts. They live in a separate repository; if it is
-      # private, give this workflow a fine-grained, read-only token for it in AGENTBANK_CONTRACTS_TOKEN.
-      - name: Check out the Agent Bank contracts
-        id: contracts
-        continue-on-error: true
-        uses: actions/checkout@v7
-        with:
-          repository: ${{ vars.AGENTBANK_CONTRACTS_REPO || 'bank-of-an-agent/contracts' }}
-          ref: ${{ vars.AGENTBANK_CONTRACTS_REF || 'main' }}
-          path: .agentbank-contracts
-          submodules: recursive
-          persist-credentials: false
-          token: ${{ secrets.AGENTBANK_CONTRACTS_TOKEN || github.token }}
-      - name: Build the Agent Bank contracts
-        id: build
-        if: steps.contracts.outcome == 'success'
-        continue-on-error: true
-        working-directory: .agentbank-contracts
-        run: forge build
-      - name: Warn when the drill runs without the Agent Bank contracts
-        if: steps.contracts.outcome != 'success' || steps.build.outcome != 'success'
-        run: echo "::warning::Agent Bank contracts unavailable; the escrow/stream/vault parts of the shutdown drill are skipped."
+      # The drill deploys the Agent Bank contracts from the artifacts vendored in
+      # test/fixtures/agentbank-contracts (scripts/vendor-contracts.sh; SOURCE records the contracts
+      # commit), so CI needs no access to the contracts repository. REQUIRE_AGENTBANK_CONTRACTS=1
+      # makes a missing artifact fail the job: the drill never silently skips a part.
       - name: Shutdown drill
         env:
-          AGENTBANK_CONTRACTS_OUT: ${{ steps.build.outcome == 'success' && format('{0}/.agentbank-contracts/out', github.workspace) || '' }}
-          REQUIRE_AGENTBANK_CONTRACTS: ${{ inputs.require_contracts && '1' || '0' }}
+          REQUIRE_AGENTBANK_CONTRACTS: "1"
+          DRILL_TRANSCRIPT_DIR: ${{ runner.temp }}/shutdown-drill
         run: pnpm test:integration
+      - name: Keep the drill summary and CLI transcripts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: shutdown-drill
+          path: ${{ runner.temp }}/shutdown-drill
+          if-no-files-found: ignore
 
+  # Runs against the public Base Sepolia RPC (or BASE_SEPOLIA_RPC_URL, if that secret is set) through a
+  # local Anvil fork: nothing is sent to Base Sepolia, only Anvil development keys sign, and the suite
+  # skips with a warning on the job summary when the RPC is unreachable or cannot serve the fork block.
   base-sepolia-fork:
-    name: Base Sepolia fork (real Safe7579, recovery module, USDC)
+    name: Base Sepolia fork (real Safe7579, recovery module, OwnableValidator, USDC)
     if: github.event_name == 'workflow_dispatch' && inputs.run_fork_tests
     runs-on: ubuntu-latest
     timeout-minutes: 20

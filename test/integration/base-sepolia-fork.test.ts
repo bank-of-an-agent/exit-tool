@@ -4,11 +4,15 @@
  * SocialRecoveryModule (72 h, guardian recovery per contracts ADR 0002), Rhinestone's
  * OwnableValidator (module release V1), the canonical MultiSendCallOnly and Circle's FiatToken USDC.
  * Nothing is ever sent to Base Sepolia itself: the fork is local and only reads public state through
- * the RPC.
+ * the RPC, and only Anvil development keys sign.
  *
  *   RUN_FORK_TESTS=1 [BASE_SEPOLIA_RPC_URL=…] [BASE_SEPOLIA_FORK_BLOCK=…] pnpm test:integration
+ *
+ * The RPC (the public https://sepolia.base.org by default) is probed first: when it is unreachable,
+ * serves another chain or not the fork block's state, the suite is skipped with a warning (and a
+ * note in the GitHub job summary) instead of failing.
  */
-import { mkdtempSync } from "node:fs";
+import { appendFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -32,7 +36,8 @@ import { SAFE7579_ADAPTER, SAFE_V141 } from "../../src/core/constants";
 import { CANDIDE_RECOVERY_MODULES, socialRecoveryModuleAbi } from "../../src/core/recovery";
 import { ownableValidatorAbi } from "../../src/core/abis/index";
 import { OWNABLE_VALIDATORS } from "../../src/core/validator";
-import { findAnvil, startAnvil, type AnvilInstance } from "./anvil";
+import { redactRpcUrl } from "../../src/cli/context";
+import { anvilSupports, findAnvil, startAnvil, type AnvilInstance } from "./anvil";
 import {
   accounts,
   clients,
@@ -45,17 +50,69 @@ import {
   type Clients,
 } from "./harness";
 
-const enabled = process.env.RUN_FORK_TESTS === "1" && findAnvil() !== undefined;
-if (process.env.RUN_FORK_TESTS !== "1") {
-  console.warn(
-    "Base Sepolia fork tests skipped (set RUN_FORK_TESTS=1 to run them; they need network access).",
-  );
-}
-
 const RPC = process.env.BASE_SEPOLIA_RPC_URL || BASE_SEPOLIA.defaultRpcUrl;
 const FORK_BLOCK = process.env.BASE_SEPOLIA_FORK_BLOCK || "48000000";
 const RECOVERY = CANDIDE_RECOVERY_MODULES[0]!.address; // 72 hours
 const USDC = BASE_SEPOLIA.usdc!;
+
+/** Why the RPC cannot back the fork (undefined when it can): checked before anything starts. */
+async function probeRpc(url: string, block: string): Promise<string | undefined> {
+  const rpc = async (method: string, params: unknown[]): Promise<unknown> => {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = (await res.json()) as { result?: unknown; error?: { message?: string } };
+    if (body.error) throw new Error(body.error.message ?? "JSON-RPC error");
+    return body.result;
+  };
+  try {
+    const chainId = Number(await rpc("eth_chainId", []));
+    if (chainId !== BASE_SEPOLIA.id)
+      return `it serves chain ${chainId}, not Base Sepolia (${BASE_SEPOLIA.id})`;
+    const at = /^\d+$/.test(block) ? toHex(BigInt(block)) : "latest";
+    const code = await rpc("eth_getCode", [USDC, at]);
+    if (typeof code !== "string" || code === "0x") return `it does not serve the state of block ${block}`;
+    return undefined;
+  } catch (err) {
+    return `it is unreachable (${err instanceof Error ? err.message : String(err)})`;
+  }
+}
+
+const requested = process.env.RUN_FORK_TESTS === "1";
+const anvilFound = requested && findAnvil() !== undefined;
+const unavailable = anvilFound ? await probeRpc(RPC, FORK_BLOCK) : undefined;
+const enabled = anvilFound && unavailable === undefined;
+if (!requested) {
+  console.warn(
+    "Base Sepolia fork tests skipped (set RUN_FORK_TESTS=1 to run them; they need network access).",
+  );
+} else if (!anvilFound) {
+  console.warn("Base Sepolia fork tests skipped: anvil not found (install Foundry or set ANVIL_BIN).");
+} else if (unavailable) {
+  const message = `Base Sepolia fork tests SKIPPED: the RPC ${redactRpcUrl(RPC)} cannot back the fork: ${unavailable}.`;
+  console.warn(message);
+  if (process.env.GITHUB_STEP_SUMMARY)
+    appendFileSync(process.env.GITHUB_STEP_SUMMARY, `> [!WARNING]\n> ${message}\n\n`);
+}
+
+/** Fork options: patient with a public endpoint (rate limits, slow responses). */
+const forkArgs = (): string[] => [
+  "--fork-url",
+  RPC,
+  "--fork-block-number",
+  FORK_BLOCK,
+  "--retries",
+  "10",
+  "--fork-retry-backoff",
+  "1000",
+  "--timeout",
+  "60000",
+  ...(anvilSupports("--no-fork-node-info") ? ["--no-fork-node-info"] : []),
+];
 const DESTINATION = getAddress(keccak256(toHex("agentbank-exit fork destination")).slice(0, 42));
 const NEW_OWNER = getAddress(keccak256(toHex("agentbank-exit fork recovery target")).slice(0, 42));
 const ownerEnv = { OWNER_PRIVATE_KEY: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d" };
@@ -86,7 +143,7 @@ describe.skipIf(!enabled)("Base Sepolia fork: real Safe7579, Candide recovery mo
   const base = () => ["--rpc-url", anvil.rpcUrl, "--chain", "base-sepolia", "--account", safe];
 
   beforeAll(async () => {
-    anvil = await startAnvil(["--fork-url", RPC, "--fork-block-number", FORK_BLOCK]);
+    anvil = await startAnvil(forkArgs());
     c = clients(anvil.rpcUrl, 84532);
 
     // An Agent Bank-style account on the real contracts: 7579 adapter as module and fallback handler,
