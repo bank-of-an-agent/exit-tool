@@ -171,6 +171,10 @@ describe("signer-only plan files", () => {
     delegate.steps[1].safeTx.operation = 1; // a DELEGATECALL to anything but the revoke batch
     expect(() => parsePlanFile(delegate, { chainId: 84532 })).toThrow(/only allowed for the revoke batch/);
 
+    const elsewhere = JSON.parse(JSON.stringify(file()));
+    elsewhere.steps[0].call.to = DEST; // signed for the vaults contract, sent somewhere else
+    expect(() => parsePlanFile(elsewhere, { chainId: 84532 })).toThrow(/signed for/);
+
     const refund = JSON.parse(JSON.stringify(file()));
     refund.steps[1].safeTx.gasPrice = "1"; // the Safe would pay the executor
     expect(() => parsePlanFile(refund, { chainId: 84532 })).toThrow(/refund fields must all be zero/);

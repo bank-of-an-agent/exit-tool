@@ -330,6 +330,12 @@ export function parsePlanFile(
         `Plan step ${step.index}: vault signature domain is for another chain.`,
       );
     }
+    if (step.vault && !isAddressEqual(step.vault.domain.verifyingContract, step.call.to)) {
+      throw new ExitToolError(
+        "plan_mismatch",
+        `Plan step ${step.index}: the early withdrawal is signed for ${step.vault.domain.verifyingContract} but sent to ${step.call.to}.`,
+      );
+    }
   }
   return { file: { ...file, account }, steps };
 }
