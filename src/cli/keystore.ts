@@ -69,27 +69,36 @@ export async function decryptKeystore(json: unknown, password: string): Promise<
   const k = parse(json);
   const { kdf, kdfparams } = k.crypto;
   const salt = Buffer.from(strip(kdfparams.salt), "hex");
-  let derived: Buffer;
-  if (kdf === "scrypt") {
-    const { n, r, p, dklen } = kdfparams;
-    if (!n || !r || !p) throw new ExitToolError("invalid_key", "Keystore scrypt parameters are incomplete.");
-    derived = await scryptAsync(password.normalize("NFKC"), salt, dklen, {
-      N: n,
-      r,
-      p,
-      maxmem: 256 * n * r + 64 * 1024 * 1024,
-    });
-  } else if (kdf === "pbkdf2") {
-    if (kdfparams.prf !== "hmac-sha256" || !kdfparams.c) {
-      throw new ExitToolError("invalid_key", "Unsupported keystore pbkdf2 parameters.");
-    }
-    derived = await pbkdf2Async(password.normalize("NFKC"), salt, kdfparams.c, kdfparams.dklen, "sha256");
-  } else {
-    throw new ExitToolError("invalid_key", `Unsupported keystore KDF ${String(kdf)}.`);
+  if (!Number.isInteger(kdfparams.dklen) || kdfparams.dklen < 32) {
+    throw new ExitToolError("invalid_key", "Keystore key length must be at least 32 bytes.");
   }
+  const derive = async (secret: string): Promise<Buffer> => {
+    if (kdf === "scrypt") {
+      const { n, r, p, dklen } = kdfparams;
+      if (!n || !r || !p)
+        throw new ExitToolError("invalid_key", "Keystore scrypt parameters are incomplete.");
+      return scryptAsync(secret, salt, dklen, { N: n, r, p, maxmem: 256 * n * r + 64 * 1024 * 1024 });
+    }
+    if (kdf === "pbkdf2") {
+      if (kdfparams.prf !== "hmac-sha256" || !kdfparams.c) {
+        throw new ExitToolError("invalid_key", "Unsupported keystore pbkdf2 parameters.");
+      }
+      return pbkdf2Async(secret, salt, kdfparams.c, kdfparams.dklen, "sha256");
+    }
+    throw new ExitToolError("invalid_key", `Unsupported keystore KDF ${String(kdf)}.`);
+  };
   const ciphertext = Buffer.from(strip(k.crypto.ciphertext), "hex");
-  const mac = keccak256(new Uint8Array(Buffer.concat([derived.subarray(16, 32), ciphertext])));
-  if (strip(mac).toLowerCase() !== strip(k.crypto.mac).toLowerCase()) {
+  const macMatches = (d: Buffer): boolean =>
+    strip(keccak256(new Uint8Array(Buffer.concat([d.subarray(16, 32), ciphertext])))).toLowerCase() ===
+    strip(k.crypto.mac).toLowerCase();
+  // geth and Foundry use the passphrase bytes as typed; ethers normalises to NFKC first. Try both.
+  let derived = await derive(password);
+  if (!macMatches(derived) && password.normalize("NFKC") !== password) {
+    derived.fill(0);
+    derived = await derive(password.normalize("NFKC"));
+  }
+  if (!macMatches(derived)) {
+    derived.fill(0);
     throw new ExitToolError("invalid_key", "Wrong keystore passphrase (MAC mismatch).");
   }
   const decipher = createDecipheriv(
