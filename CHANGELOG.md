@@ -17,6 +17,12 @@ All notable changes to `@agentbank/exit` are documented here. The format follows
 - Owner path only: every account action is an EIP-712 `SafeTx` executed through `execTransaction`;
   public recovery steps (escrow refunds, vault withdrawals, stream settlements) are plain calls that
   can only pay the account.
+- Atomic revocation: every Safe module (including the Safe7579 adapter) is disabled and the fallback
+  handler reset in one Safe transaction through the canonical MultiSendCallOnly (code hash checked);
+  a transaction guard is removed first.
+- `inspect` reports the Safe configuration, Agent Bank executors and hook (TopUpExecutor,
+  SweepExecutor, AgentPolicyHook), treasury-fund shares, and a plain-language split between what can
+  be recovered now and what becomes recoverable later (with dates).
 - Dry run by default with a full `eth_simulateV1` simulation of the plan (no key needed), balance
   deltas and gas estimates; `--execute` with an interactive confirmation (`--yes` for scripts); tx
   hashes and explorer links.
