@@ -48,7 +48,12 @@ import {
   recoverSafeTxSigner,
   type OwnerSignature,
 } from "../core/safe";
-import { materializeAndSimulate, type MaterializedStep, type SimulationResult } from "../core/simulate";
+import {
+  materializeAndSimulate,
+  pickSimulationSigners,
+  type MaterializedStep,
+  type SimulationResult,
+} from "../core/simulate";
 import { summarizeRecovery } from "../core/summary";
 import { earlyWithdrawalTypedData } from "../core/vaults";
 import { VERSION } from "../version";
@@ -404,17 +409,6 @@ async function runCommand(command: Exclude<Command, "submit" | "help">, ctx: Con
   const after = await finalState(ctx, account, signer, needsPositions);
   printer.document({ ...baseDoc, dryRun: false, execution: results, after });
   return 0;
-}
-
-function pickSimulationSigners(report: AccountReport, signer: Address | undefined): Address[] {
-  const owners = report.safe.owners;
-  const out: Address[] = [];
-  if (signer && owners.some((o) => isAddressEqual(o, signer))) out.push(getAddress(signer));
-  for (const o of owners) {
-    if (BigInt(out.length) >= report.safe.threshold) break;
-    if (!out.some((x) => isAddressEqual(x, o))) out.push(o);
-  }
-  return out;
 }
 
 async function buildPlan(

@@ -1,6 +1,7 @@
 import {
   decodeFunctionResult,
   encodeFunctionData,
+  getAddress,
   hexToBigInt,
   isAddressEqual,
   pad,
@@ -95,6 +96,21 @@ interface SimCall {
   to: Address;
   data: Hex;
   value: bigint;
+}
+
+/**
+ * The owners a simulation stands in for: the signer first (when it is an owner), then other owners
+ * up to the threshold.
+ */
+export function pickSimulationSigners(report: AccountReport, signer: Address | undefined): Address[] {
+  const owners = report.safe.owners;
+  const out: Address[] = [];
+  if (signer && owners.some((o) => isAddressEqual(o, signer))) out.push(getAddress(signer));
+  for (const o of owners) {
+    if (BigInt(out.length) >= report.safe.threshold) break;
+    if (!out.some((x) => isAddressEqual(x, o))) out.push(o);
+  }
+  return out;
 }
 
 /** State overrides that let a dry run stand in for the owners' signatures (simulation only). */

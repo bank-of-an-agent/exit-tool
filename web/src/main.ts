@@ -30,7 +30,11 @@ import { inspectAccount, type AccountReport } from "../../src/core/inspect";
 import { planExit, planRevoke, planWithdrawStep, type Plan } from "../../src/core/plan";
 import { readTokenInfo } from "../../src/core/positions";
 import { describeError } from "../../src/core/revert";
-import { materializeAndSimulate, type SimulationResult } from "../../src/core/simulate";
+import {
+  materializeAndSimulate,
+  pickSimulationSigners,
+  type SimulationResult,
+} from "../../src/core/simulate";
 import { summarizeRecovery } from "../../src/core/summary";
 import { VERSION } from "../../src/version";
 
@@ -380,13 +384,8 @@ async function preview(kind: "withdraw" | "exit" | "revoke"): Promise<void> {
     status("Nothing to do.", "ok");
     return;
   }
-  const signers = [
-    state.wallet && report.safe.owners.some((o) => isAddressEqual(o, state.wallet!))
-      ? state.wallet
-      : report.safe.owners[0]!,
-  ];
   const sim = await materializeAndSimulate(client, report, plan, {
-    simulatedSigners: signers,
+    simulatedSigners: pickSimulationSigners(report, state.wallet),
     vaultSignatureTtl: 3_600n,
     tokens: Object.values(report.tokens).map((t) => t.address),
   });
