@@ -566,11 +566,17 @@ function init(): void {
   $("all").addEventListener("change", () => {
     input("amount").disabled = input("all").checked;
   });
-  window.ethereum?.on?.("chainChanged", () => {
+  const reset = (message: string): void => {
     state.client = undefined;
     state.report = undefined;
-    status("The wallet switched networks: connect again.", "info");
-  });
+    state.plan = undefined;
+    state.sim = undefined;
+    clear($("plan"));
+    $("actions").hidden = true;
+    status(message, "info");
+  };
+  window.ethereum?.on?.("chainChanged", () => reset("The wallet switched networks: connect again."));
+  window.ethereum?.on?.("accountsChanged", () => reset("The wallet switched accounts: connect again."));
   status(
     window.ethereum
       ? "Connect your owner wallet to start."
