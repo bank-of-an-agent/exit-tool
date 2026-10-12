@@ -9,6 +9,10 @@ import {
   type PublicClient,
 } from "viem";
 import { agentEscrowAbi, erc20Abi, paymentStreamsAbi, timeLockVaultsAbi } from "./abis/index";
+import { mapLimit } from "./limit";
+
+/** Parallel reads per batch of positions (public RPCs rate-limit bursts). */
+const READ_CONCURRENCY = 6;
 
 /** ERC-20 metadata (with safe fallbacks for tokens that do not implement the optional views). */
 export interface TokenInfo {
@@ -82,48 +86,46 @@ export async function readEscrows(
   account: Address,
   now: bigint,
 ): Promise<EscrowPosition[]> {
-  return Promise.all(
-    ids.map(async (id) => {
-      const [e, refundableAt] = await Promise.all([
-        client.readContract({ address: escrow, abi: agentEscrowAbi, functionName: "getEscrow", args: [id] }),
-        client.readContract({
-          address: escrow,
-          abi: agentEscrowAbi,
-          functionName: "refundableAt",
-          args: [id],
-        }),
-      ]);
-      const status = ESCROW_STATUS[e.status] ?? "None";
-      const open = status === "Active" || status === "Disputed";
-      const role = isAddressEqual(e.payer, account) ? "payer" : "payee";
-      let releasableNow = false;
-      if (
-        role === "payee" &&
-        status === "Active" &&
-        e.validator !== "0x0000000000000000000000000000000000000000"
-      ) {
-        const [satisfied] = await client
-          .readContract({ address: escrow, abi: agentEscrowAbi, functionName: "checkValidation", args: [id] })
-          .catch(() => [false] as const);
-        releasableNow = satisfied;
-      }
-      return {
-        id,
-        role,
-        status,
-        payer: getAddress(e.payer),
-        payee: getAddress(e.payee),
-        token: getAddress(e.token),
-        amount: e.amount,
-        expiresAt: BigInt(e.expiresAt),
-        arbiter: getAddress(e.arbiter),
-        validator: getAddress(e.validator),
-        refundableAt,
-        refundableNow: role === "payer" && open && refundableAt !== 0n && now >= refundableAt,
-        releasableNow,
-      } satisfies EscrowPosition;
-    }),
-  );
+  return mapLimit(ids, READ_CONCURRENCY, async (id) => {
+    const [e, refundableAt] = await Promise.all([
+      client.readContract({ address: escrow, abi: agentEscrowAbi, functionName: "getEscrow", args: [id] }),
+      client.readContract({
+        address: escrow,
+        abi: agentEscrowAbi,
+        functionName: "refundableAt",
+        args: [id],
+      }),
+    ]);
+    const status = ESCROW_STATUS[e.status] ?? "None";
+    const open = status === "Active" || status === "Disputed";
+    const role = isAddressEqual(e.payer, account) ? "payer" : "payee";
+    let releasableNow = false;
+    if (
+      role === "payee" &&
+      status === "Active" &&
+      e.validator !== "0x0000000000000000000000000000000000000000"
+    ) {
+      const [satisfied] = await client
+        .readContract({ address: escrow, abi: agentEscrowAbi, functionName: "checkValidation", args: [id] })
+        .catch(() => [false] as const);
+      releasableNow = satisfied;
+    }
+    return {
+      id,
+      role,
+      status,
+      payer: getAddress(e.payer),
+      payee: getAddress(e.payee),
+      token: getAddress(e.token),
+      amount: e.amount,
+      expiresAt: BigInt(e.expiresAt),
+      arbiter: getAddress(e.arbiter),
+      validator: getAddress(e.validator),
+      refundableAt,
+      refundableNow: role === "payer" && open && refundableAt !== 0n && now >= refundableAt,
+      releasableNow,
+    } satisfies EscrowPosition;
+  });
 }
 
 export interface StreamPosition {
@@ -154,49 +156,47 @@ export async function readStreams(
   ids: readonly bigint[],
   account: Address,
 ): Promise<StreamPosition[]> {
-  return Promise.all(
-    ids.map(async (id) => {
-      const [s, accrued, settleable] = await Promise.all([
-        client.readContract({
-          address: streams,
-          abi: paymentStreamsAbi,
-          functionName: "getStream",
-          args: [id],
-        }),
-        client.readContract({
-          address: streams,
-          abi: paymentStreamsAbi,
-          functionName: "accrued",
-          args: [id],
-        }),
-        client.readContract({
-          address: streams,
-          abi: paymentStreamsAbi,
-          functionName: "settleable",
-          args: [id],
-        }),
-      ]);
-      const role = isAddressEqual(s.payer, account) ? "payer" : "payee";
-      return {
-        id,
-        role,
-        payer: getAddress(s.payer),
-        payee: getAddress(s.payee),
-        token: getAddress(s.token),
-        deposit: s.deposit,
-        paid: s.paid,
-        refunded: s.refunded,
-        canceled: s.canceled,
-        start: BigInt(s.start),
-        stop: BigInt(s.stop),
-        interval: BigInt(s.interval),
-        amountPerInterval: s.amountPerInterval,
-        accrued,
-        settleable,
-        refundIfCanceled: role === "payer" && !s.canceled ? s.deposit - accrued : 0n,
-      } satisfies StreamPosition;
-    }),
-  );
+  return mapLimit(ids, READ_CONCURRENCY, async (id) => {
+    const [s, accrued, settleable] = await Promise.all([
+      client.readContract({
+        address: streams,
+        abi: paymentStreamsAbi,
+        functionName: "getStream",
+        args: [id],
+      }),
+      client.readContract({
+        address: streams,
+        abi: paymentStreamsAbi,
+        functionName: "accrued",
+        args: [id],
+      }),
+      client.readContract({
+        address: streams,
+        abi: paymentStreamsAbi,
+        functionName: "settleable",
+        args: [id],
+      }),
+    ]);
+    const role = isAddressEqual(s.payer, account) ? "payer" : "payee";
+    return {
+      id,
+      role,
+      payer: getAddress(s.payer),
+      payee: getAddress(s.payee),
+      token: getAddress(s.token),
+      deposit: s.deposit,
+      paid: s.paid,
+      refunded: s.refunded,
+      canceled: s.canceled,
+      start: BigInt(s.start),
+      stop: BigInt(s.stop),
+      interval: BigInt(s.interval),
+      amountPerInterval: s.amountPerInterval,
+      accrued,
+      settleable,
+      refundIfCanceled: role === "payer" && !s.canceled ? s.deposit - accrued : 0n,
+    } satisfies StreamPosition;
+  });
 }
 
 export interface VaultPosition {
@@ -215,25 +215,23 @@ export async function readVaults(
   ids: readonly bigint[],
   now: bigint,
 ): Promise<VaultPosition[]> {
-  return Promise.all(
-    ids.map(async (id) => {
-      const v = await client.readContract({
-        address: vaults,
-        abi: timeLockVaultsAbi,
-        functionName: "getVault",
-        args: [id],
-      });
-      return {
-        id,
-        token: getAddress(v.token),
-        balance: v.balance,
-        unlockAt: BigInt(v.unlockAt),
-        owner: getAddress(v.owner),
-        nonce: BigInt(v.nonce),
-        unlocked: now >= BigInt(v.unlockAt),
-      } satisfies VaultPosition;
-    }),
-  );
+  return mapLimit(ids, READ_CONCURRENCY, async (id) => {
+    const v = await client.readContract({
+      address: vaults,
+      abi: timeLockVaultsAbi,
+      functionName: "getVault",
+      args: [id],
+    });
+    return {
+      id,
+      token: getAddress(v.token),
+      balance: v.balance,
+      unlockAt: BigInt(v.unlockAt),
+      owner: getAddress(v.owner),
+      nonce: BigInt(v.nonce),
+      unlocked: now >= BigInt(v.unlockAt),
+    } satisfies VaultPosition;
+  });
 }
 
 /** An agent spend key's USDC float that the account can pull back (ADR 0001 permit allowance). */
@@ -252,24 +250,22 @@ export async function readSpendKeys(
   keys: readonly Address[],
   account: Address,
 ): Promise<SpendKeyFloat[]> {
-  return Promise.all(
-    keys.map(async (key) => {
-      const [balance, allowance] = await Promise.all([
-        client.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [key] }),
-        client.readContract({
-          address: token,
-          abi: erc20Abi,
-          functionName: "allowance",
-          args: [key, account],
-        }),
-      ]);
-      return {
-        address: getAddress(key),
-        token: getAddress(token),
-        balance,
-        allowance,
-        sweepable: balance < allowance ? balance : allowance,
-      };
-    }),
-  );
+  return mapLimit(keys, READ_CONCURRENCY, async (key) => {
+    const [balance, allowance] = await Promise.all([
+      client.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [key] }),
+      client.readContract({
+        address: token,
+        abi: erc20Abi,
+        functionName: "allowance",
+        args: [key, account],
+      }),
+    ]);
+    return {
+      address: getAddress(key),
+      token: getAddress(token),
+      balance,
+      allowance,
+      sweepable: balance < allowance ? balance : allowance,
+    };
+  });
 }

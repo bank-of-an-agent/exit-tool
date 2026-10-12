@@ -11,6 +11,7 @@ import {
   type SpendKeyDiscovery,
 } from "./discovery";
 import { ExitToolError } from "./errors";
+import { isCanonicalMultiSendCallOnly, MULTISEND_CALL_ONLY } from "./multisend";
 import {
   readEscrows,
   readSpendKeys,
@@ -82,6 +83,8 @@ export interface AccountReport {
   /** Human labels for known addresses (lowercase keys). */
   labels: Record<string, string>;
   compatibilityFallbackHandler: Address;
+  /** The canonical MultiSendCallOnly, when its code was verified on this chain (enables the atomic revoke). */
+  multiSendCallOnly?: Address;
 }
 
 const KNOWN_SINGLETONS: Record<string, string> = {
@@ -166,7 +169,7 @@ function safeFindings(
     findings.push({
       severity: "warning",
       code: "guard_set",
-      message: `A transaction guard ${safe.guard} is set: it inspects (and can block) every owner transaction. exit removes it first unless --keep-guard.`,
+      message: `A transaction guard ${safe.guard} is set: it inspects (and can block) every owner transaction. The exit removes it first.`,
     });
   }
   if (signer) {
@@ -235,6 +238,7 @@ export async function inspectAccount(client: PublicClient, options: InspectOptio
   };
   if (signer)
     report.signer = { address: signer, isOwner: safe.owners.some((o) => isAddressEqual(o, signer)) };
+  if (await isCanonicalMultiSendCallOnly(client)) report.multiSendCallOnly = MULTISEND_CALL_ONLY;
 
   if (missing.length > 0) {
     report.findings.push({

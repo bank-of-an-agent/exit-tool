@@ -1,5 +1,7 @@
-import { getAddress, isAddressEqual, type Address, type Hex } from "viem";
+import { getAddress, isAddressEqual, toFunctionSelector, type Address, type Hex } from "viem";
+import { ZERO_ADDRESS } from "./constants";
 import { ExitToolError } from "./errors";
+import { decodeMultiSend, MULTISEND_CALL_ONLY } from "./multisend";
 import { hashSafeTx, safeTxTypedDataJson, type SafeTx } from "./safe";
 import type { MaterializedStep } from "./simulate";
 import {
@@ -10,6 +12,22 @@ import {
 } from "./vaults";
 
 export const PLAN_FORMAT = "agentbank-exit-plan/v1";
+
+/** disableModule, setFallbackHandler, setGuard: what the revoke batch may call on the account. */
+const REVOKE_SELECTORS = new Set<string>([
+  toFunctionSelector("disableModule(address,address)"),
+  toFunctionSelector("setFallbackHandler(address)"),
+  toFunctionSelector("setGuard(address)"),
+]);
+
+/** The public recovery calls a plan may contain (each can only pay the account). */
+const PUBLIC_RECOVERY_SELECTORS = new Set<string>([
+  toFunctionSelector("refund(uint256)"),
+  toFunctionSelector("releaseByValidation(uint256)"),
+  toFunctionSelector("settle(uint256)"),
+  toFunctionSelector("withdraw(uint256,uint256)"),
+  toFunctionSelector("withdrawWithSignature(uint256,uint256,uint256,bytes)"),
+]);
 
 /** One thing to sign on a hardware wallet. */
 export interface SignPayload {
@@ -136,10 +154,20 @@ function deserializeStep(raw: unknown): MaterializedStep {
       refundReceiver: addr(t.refundReceiver, "safeTx.refundReceiver"),
       nonce: big(t.nonce, "safeTx.nonce"),
     };
-    if (step.safeTx.operation !== 0) {
+    if (step.safeTx.operation !== 0 && step.safeTx.operation !== 1) {
+      throw new ExitToolError("plan_mismatch", "Plan file: operation must be 0 (CALL) or the revoke batch.");
+    }
+    const t2 = step.safeTx;
+    if (
+      t2.safeTxGas !== 0n ||
+      t2.baseGas !== 0n ||
+      t2.gasPrice !== 0n ||
+      !isAddressEqual(t2.gasToken, ZERO_ADDRESS) ||
+      !isAddressEqual(t2.refundReceiver, ZERO_ADDRESS)
+    ) {
       throw new ExitToolError(
         "plan_mismatch",
-        "Plan file: only CALL Safe transactions are allowed (operation must be 0).",
+        "Plan file: SafeTx gas refund fields must all be zero (the Safe never pays the executor).",
       );
     }
   }
@@ -263,6 +291,36 @@ export function parsePlanFile(
         throw new ExitToolError(
           "plan_mismatch",
           `Plan step ${step.index}: SafeTx does not match the step's call.`,
+        );
+      }
+    }
+    if (step.safeTx?.operation === 1) {
+      // The only DELEGATECALL the tool produces: the atomic revoke batch through the canonical
+      // MultiSendCallOnly, whose inner calls may only reconfigure the account itself.
+      const inner = isAddressEqual(step.safeTx.to, MULTISEND_CALL_ONLY)
+        ? decodeMultiSend(step.safeTx.data)
+        : undefined;
+      if (
+        !inner ||
+        !inner.every(
+          (c) =>
+            isAddressEqual(c.to, account) &&
+            c.value === 0n &&
+            REVOKE_SELECTORS.has(c.data.slice(0, 10).toLowerCase()),
+        )
+      ) {
+        throw new ExitToolError(
+          "plan_mismatch",
+          `Plan step ${step.index}: a DELEGATECALL is only allowed for the revoke batch through MultiSendCallOnly.`,
+        );
+      }
+    }
+    if (step.via === "direct" && !step.skipped) {
+      const selector = step.call.data.slice(0, 10).toLowerCase();
+      if (step.call.value !== 0n || !PUBLIC_RECOVERY_SELECTORS.has(selector)) {
+        throw new ExitToolError(
+          "plan_mismatch",
+          `Plan step ${step.index}: a public step may only refund, settle or withdraw to the account (got ${selector}).`,
         );
       }
     }

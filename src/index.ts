@@ -13,6 +13,8 @@ export * from "./core/discovery";
 export * from "./core/errors";
 export * from "./core/execute";
 export * from "./core/inspect";
+export * from "./core/limit";
+export * from "./core/multisend";
 export * from "./core/plan";
 export * from "./core/planfile";
 export * from "./core/positions";

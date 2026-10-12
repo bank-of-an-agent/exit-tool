@@ -11,6 +11,7 @@
  * the owner key, and every recoverable unit must reach the owner's destination.
  */
 import { mkdirSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import path from "node:path";
 import { createCipheriv, createHash, randomBytes, scryptSync } from "node:crypto";
 import { getAddress, keccak256, parseEther, parseEventLogs, type Abi, type Address, type Hex } from "viem";
@@ -235,6 +236,55 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
     );
   });
 
+  it.skipIf(!haveAgentBank)(
+    "works through a restricted public-style RPC (no eth_simulateV1, tiny eth_getLogs ranges)",
+    async () => {
+      const proxy = await restrictedRpc(drill.anvil.rpcUrl, 10n);
+      try {
+        const base = [
+          "--rpc-url",
+          proxy.url,
+          "--chain",
+          "anvil",
+          "--account",
+          drill.safe,
+          "--deployments",
+          drill.deploymentsFile,
+        ];
+        // Event scans are chunked to the 10-block limit the RPC announces.
+        const chunked = await runCli(["inspect", ...base, "--json"]);
+        expect(chunked.code, chunked.stderr).toBe(0);
+        const d1 = (
+          chunked.json!.report as { discovery: { positions: { method: string; requests: number } } }
+        ).discovery;
+        expect(d1.positions.method).toBe("events");
+        expect(d1.positions.requests).toBeGreaterThan(4);
+        // With a request budget too small for the scan, positions are found by enumeration instead.
+        const enumerated = await runCli(["inspect", ...base, "--max-log-requests", "3", "--json"]);
+        expect(enumerated.code, enumerated.stderr).toBe(0);
+        const r2 = enumerated.json!.report as {
+          escrows: unknown[];
+          streams: unknown[];
+          vaults: unknown[];
+          discovery: { positions: { method: string } };
+        };
+        expect(r2.discovery.positions.method).toBe("enumeration");
+        expect([r2.escrows.length, r2.streams.length, r2.vaults.length]).toEqual([4, 3, 3]);
+        // Without eth_simulateV1 every step is still simulated (each against the current state).
+        const dry = await runCli(["exit", ...base, "--to", DESTINATION, "--json"]);
+        expect(dry.code, dry.stderr + dry.stdout).toBe(0);
+        const sim = dry.json!.simulation as { ok: boolean; method: string };
+        expect(sim).toMatchObject({ ok: true, method: "eth_call" });
+        expect(proxy.refused()).toBeGreaterThan(0);
+        summary.push(
+          "restricted RPC (no eth_simulateV1, 10-block eth_getLogs): chunked event scan, enumeration fallback and per-step simulation all work",
+        );
+      } finally {
+        proxy.close();
+      }
+    },
+  );
+
   it("refuses to broadcast without confirmation and refuses mainnet-like misuse", async () => {
     const run = await runCli(
       ["withdraw", ...cliBase(), "--to", DESTINATION, "--token", "eth", "--amount", "0.1", "--execute"],
@@ -264,6 +314,9 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
     expect(origins(run.urls)).toEqual([new URL(drill.anvil.rpcUrl).origin]);
     const executed = run.json!.execution as { status: string; hash?: Hex; id: string }[];
     expect(executed.length).toBeGreaterThan(0);
+    // The guard goes first on its own; then ONE transaction removes both modules and the 7579
+    // fallback handler, so nothing can act between the removals.
+    expect(executed.slice(0, 2).map((e) => e.id.split(":")[0])).toEqual(["remove-guard", "revoke-batch"]);
 
     // The account is empty and every agent/bank power is gone.
     expect(await balanceOf(drill.safe)).toBe(0n);
@@ -752,6 +805,62 @@ function transcript(name: string, run: { stdout: string; stderr: string }, args:
   mkdirSync(dir, { recursive: true });
   const cmd = `$ agentbank-exit ${args.join(" ")}`;
   writeFileSync(path.join(dir, `${name}.txt`), `${cmd}\n${run.stderr}${run.stdout}`);
+}
+
+/**
+ * A JSON-RPC proxy in front of Anvil that behaves like a restrictive public endpoint: no
+ * eth_simulateV1, and eth_getLogs limited to `maxRange` blocks (with the error text Base Sepolia's
+ * public RPC uses).
+ */
+async function restrictedRpc(upstream: string, maxRange: bigint) {
+  let refused = 0;
+  type Req = { id: number; method: string; params?: unknown[] };
+  const handle = async (req: Req): Promise<unknown> => {
+    if (req.method === "eth_simulateV1") {
+      refused += 1;
+      return {
+        jsonrpc: "2.0",
+        id: req.id,
+        error: { code: -32601, message: "the method eth_simulateV1 does not exist/is not available" },
+      };
+    }
+    if (req.method === "eth_getLogs") {
+      const f = (req.params?.[0] ?? {}) as { fromBlock?: string; toBlock?: string };
+      const latest = BigInt(await drill.c.publicClient.getBlockNumber());
+      const from = f.fromBlock && f.fromBlock.startsWith("0x") ? BigInt(f.fromBlock) : 0n;
+      const to = f.toBlock && f.toBlock.startsWith("0x") ? BigInt(f.toBlock) : latest;
+      if (to - from + 1n > maxRange) {
+        refused += 1;
+        return {
+          jsonrpc: "2.0",
+          id: req.id,
+          error: { code: -32614, message: `eth_getLogs is limited to a ${maxRange} range` },
+        };
+      }
+    }
+    const res = await fetch(upstream, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(req),
+    });
+    return res.json();
+  };
+  const server = createServer((request, response) => {
+    let body = "";
+    request.on("data", (c: Buffer) => (body += c.toString()));
+    request.on("end", () => {
+      const parsed = JSON.parse(body) as Req | Req[];
+      const work = Array.isArray(parsed) ? Promise.all(parsed.map(handle)) : handle(parsed);
+      void work.then((out) => {
+        response.setHeader("content-type", "application/json");
+        response.end(JSON.stringify(out));
+      });
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : 0;
+  return { url: `http://127.0.0.1:${port}`, refused: () => refused, close: () => server.close() };
 }
 
 /** Distinct origins a CLI run contacted. */

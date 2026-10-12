@@ -290,7 +290,7 @@ export async function materializeAndSimulate(
     }
     const materialized: MaterializedStep = { ...base, call, ...(vault ? { vault } : {}) };
     if (step.via === "safe") {
-      const safeTx = safeTxForCall(call, safeNonce);
+      const safeTx = safeTxForCall(call, safeNonce, step.operation ?? 0);
       safeNonce += 1n;
       materialized.safeTx = safeTx;
       materialized.safeTxHash = hashSafeTx(plan.chainId, account, safeTx);
@@ -370,14 +370,13 @@ export async function materializeAndSimulate(
     for (const s of active) {
       const sim = prior[active.indexOf(s)]!;
       try {
-        const res = await client.call({
+        await client.call({
           account: sim.account,
           to: sim.to,
           data: sim.data,
           value: sim.value,
           stateOverride: overrides,
         });
-        void res;
         const gas = await client
           .estimateGas({
             account: sim.account,
@@ -403,7 +402,7 @@ export async function materializeAndSimulate(
     for (const r of results) {
       if (r.status !== "failure") continue;
       const s = steps.find((x) => x.index === r.index);
-      if (!s || s.via !== "safe" || !r.error?.startsWith("GS013")) continue;
+      if (!s || s.via !== "safe" || s.safeTx?.operation !== 0 || !r.error?.startsWith("GS013")) continue;
       const before = prior.slice(0, active.indexOf(s));
       try {
         const [block] = await client.simulateBlocks({

@@ -61,16 +61,17 @@ export const SAFE_TX_TYPES = {
 } as const;
 
 /**
- * The SafeTx for one call: CALL operation, no gas refund (safeTxGas = baseGas = gasPrice = 0). With
- * these values the Safe reverts the whole transaction if the inner call fails (GS013) and never pays
- * anyone from its own balance: the executor pays the gas.
+ * The SafeTx for one call: no gas refund (safeTxGas = baseGas = gasPrice = 0). With these values the
+ * Safe reverts the whole transaction if the inner call fails (GS013) and never pays anyone from its
+ * own balance: the executor pays the gas. The operation is CALL, except for the atomic revoke batch,
+ * a DELEGATECALL to the canonical MultiSendCallOnly (which itself can only make CALLs).
  */
-export function safeTxForCall(call: Call, nonce: bigint): SafeTx {
+export function safeTxForCall(call: Call, nonce: bigint, operation: number = OPERATION_CALL): SafeTx {
   return {
     to: getAddress(call.to),
     value: call.value,
     data: call.data,
-    operation: OPERATION_CALL,
+    operation,
     safeTxGas: 0n,
     baseGas: 0n,
     gasPrice: 0n,

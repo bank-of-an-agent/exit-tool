@@ -1,4 +1,6 @@
-import type { Address } from "viem";
+import { encodeFunctionData, type Address } from "viem";
+import { erc20Abi, safeAbi } from "../../src/core/abis/index";
+import { encodeMultiSend, MULTISEND_CALL_ONLY } from "../../src/core/multisend";
 import { describe, expect, it } from "vitest";
 import { buildPlanFile, parsePlanFile } from "../../src/core/planfile";
 import { hashSafeTx, safeTxForCall } from "../../src/core/safe";
@@ -95,6 +97,67 @@ describe("signer-only plan files", () => {
     expect(parsed[2]!.skipped).toBe("nothing to move");
   });
 
+  it("accept the revoke batch, and only the revoke batch, as a DELEGATECALL", () => {
+    const revoke = encodeMultiSend([
+      {
+        to: ACCOUNT,
+        value: 0n,
+        data: encodeFunctionData({
+          abi: safeAbi,
+          functionName: "disableModule",
+          args: ["0x0000000000000000000000000000000000000001", OWNER],
+        }),
+      },
+      {
+        to: ACCOUNT,
+        value: 0n,
+        data: encodeFunctionData({ abi: safeAbi, functionName: "setFallbackHandler", args: [OWNER] }),
+      },
+    ]);
+    const withBatch = (data: `0x${string}`, to: Address = MULTISEND_CALL_ONLY) => {
+      const call = { to, value: 0n, data };
+      const safeTx = safeTxForCall(call, 7n, 1);
+      return JSON.parse(
+        JSON.stringify(
+          buildPlanFile({
+            chainId: 84532,
+            account: ACCOUNT,
+            command: "disable-modules",
+            safe: { nonce: 7n, threshold: 1n, owners: [OWNER] },
+            steps: [
+              {
+                index: 1,
+                id: "revoke-batch:x",
+                title: "Revoke",
+                notes: [],
+                via: "safe",
+                category: "revoke",
+                call,
+                safeTx,
+                safeTxHash: hashSafeTx(84532, ACCOUNT, safeTx),
+              },
+            ],
+            notes: [],
+          }),
+        ),
+      );
+    };
+    expect(parsePlanFile(withBatch(revoke), { chainId: 84532 }).steps[0]!.safeTx!.operation).toBe(1);
+    const steal = encodeMultiSend([
+      {
+        to: USDC,
+        value: 0n,
+        data: encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [DEST, 1n] }),
+      },
+    ]);
+    expect(() => parsePlanFile(withBatch(steal), { chainId: 84532 })).toThrow(
+      /only allowed for the revoke batch/,
+    );
+    expect(() => parsePlanFile(withBatch(revoke, DEST), { chainId: 84532 })).toThrow(
+      /only allowed for the revoke batch/,
+    );
+  });
+
   it("refuse plans for another chain or account, and tampered transactions", () => {
     const json = JSON.parse(JSON.stringify(file()));
     expect(() => parsePlanFile(json, { chainId: 31337 })).toThrow(/chain 84532/);
@@ -105,8 +168,16 @@ describe("signer-only plan files", () => {
     expect(() => parsePlanFile(swapped, { chainId: 84532 })).toThrow(/does not match/);
 
     const delegate = JSON.parse(JSON.stringify(file()));
-    delegate.steps[1].safeTx.operation = 1; // DELEGATECALL is never produced by the tool
-    expect(() => parsePlanFile(delegate, { chainId: 84532 })).toThrow(/operation must be 0/);
+    delegate.steps[1].safeTx.operation = 1; // a DELEGATECALL to anything but the revoke batch
+    expect(() => parsePlanFile(delegate, { chainId: 84532 })).toThrow(/only allowed for the revoke batch/);
+
+    const refund = JSON.parse(JSON.stringify(file()));
+    refund.steps[1].safeTx.gasPrice = "1"; // the Safe would pay the executor
+    expect(() => parsePlanFile(refund, { chainId: 84532 })).toThrow(/refund fields must all be zero/);
+
+    const direct = JSON.parse(JSON.stringify(file()));
+    direct.steps[0].call.data = "0xa9059cbb"; // a public step that is not a refund/settle/withdraw
+    expect(() => parsePlanFile(direct, { chainId: 84532 })).toThrow(/may only refund, settle or withdraw/);
 
     const other = JSON.parse(JSON.stringify(file()));
     other.format = "something-else";

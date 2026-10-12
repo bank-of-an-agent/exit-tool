@@ -3,6 +3,7 @@ import { formatAmount } from "../core/amounts";
 import { addressUrl, txUrl, type ChainConfig } from "../core/chains";
 import { ZERO_ADDRESS } from "../core/constants";
 import { describeCall, formatTimestamp } from "../core/describe";
+import { decodeMultiSend } from "../core/multisend";
 import type { ExecutedStep } from "../core/execute";
 import type { AccountReport } from "../core/inspect";
 import type { SimulationResult } from "../core/simulate";
@@ -171,6 +172,15 @@ export function renderSimulation(
       out.push(
         `    EarlyWithdrawal nonce ${m.nonce}, deadline ${formatTimestamp(m.deadline)}, digest ${step.vault.digest}`,
       );
+    } else if (!step.skipped && step.safeTx?.operation === 1) {
+      const inner = decodeMultiSend(step.call.data) ?? [];
+      out.push(
+        `    DELEGATECALL ${step.call.to} (Safe MultiSendCallOnly v1.4.1, code hash verified), batching:`,
+      );
+      for (const c of inner) out.push(`      - ${c.to}.${describeCall(c)}`);
+      out.push(`    calldata: ${step.call.data}`);
+      if (step.safeTxHash)
+        out.push(`    SafeTx nonce ${step.safeTx.nonce}, operation 1, hash ${step.safeTxHash}`);
     } else if (!step.skipped) {
       out.push(`    call: ${step.call.to}.${describeCall(step.call)}`);
       out.push(

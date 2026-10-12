@@ -15,6 +15,7 @@ import { agentEscrowAbi, erc20Abi, multicall3Abi, paymentStreamsAbi, timeLockVau
 import { MULTICALL3 } from "./constants";
 import type { AgentBankContracts } from "./deployments";
 import { ExitToolError } from "./errors";
+import { describeError } from "./revert";
 
 /** A raw `eth_getLogs` entry (only the fields the tool needs). */
 export interface RawLog {
@@ -489,7 +490,7 @@ export async function discoverPositionIds(
   } catch (err) {
     if (options.mode === "events") throw err;
     const fallback = await discoverByEnumeration(client, account, contracts, options);
-    const reason = err instanceof Error ? err.message : String(err);
+    const reason = describeError(err);
     fallback.notes.unshift(`event scan not used (${reason})`);
     return fallback;
   }
@@ -532,7 +533,7 @@ export async function discoverSpendKeys(
     }
     return { candidates: [...owners.values()], complete: true, requests };
   } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err);
+    const reason = describeError(err);
     return {
       candidates: [],
       complete: false,

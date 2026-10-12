@@ -1,6 +1,7 @@
 import { encodeFunctionData, getAddress, isAddressEqual, type Address, type Hex } from "viem";
 import { agentEscrowAbi, erc20Abi, paymentStreamsAbi, safeAbi, timeLockVaultsAbi } from "./abis/index";
 import { SENTINEL, ZERO_ADDRESS } from "./constants";
+import { encodeMultiSend, MULTISEND_CALL_ONLY } from "./multisend";
 import { formatTimestamp } from "./describe";
 import { ExitToolError } from "./errors";
 import type { AccountReport } from "./inspect";
@@ -47,6 +48,8 @@ export interface PlanStep {
    */
   via: "safe" | "direct";
   category: "revoke" | "recover" | "withdraw";
+  /** Safe steps only: 0 = CALL (default); 1 = DELEGATECALL, used only for the canonical MultiSendCallOnly batch. */
+  operation?: 0 | 1;
   amount: AmountSource;
   /** Present for early vault withdrawals: the call needs the vault owner's signature. */
   vaultSignature?: VaultSignatureRequest;
@@ -78,6 +81,12 @@ function selfCall(account: Address, data: Hex): Call {
 
 export interface RevokeOptions {
   keepGuard?: boolean;
+  /**
+   * Remove the modules and reset the fallback handler in ONE Safe transaction (a DELEGATECALL to the
+   * canonical MultiSendCallOnly), so nothing can act between the individual removals. Defaults to
+   * whether that contract was verified on this chain during inspection.
+   */
+  batch?: boolean;
 }
 
 /**
@@ -104,37 +113,59 @@ export function planRevoke(report: AccountReport, options: RevokeOptions = {}): 
     });
   }
   // Modules are removed from the head of the linked list, so `prev` is always the sentinel.
+  const removals: { id: string; title: string; note: string; call: Call }[] = [];
   for (const module of report.safe.modules) {
     const label = report.labels[module.toLowerCase()];
-    steps.push({
+    removals.push({
       id: `disable-module:${module}`,
       title: `Disable module ${module}${label ? ` (${label.split(" (")[0]})` : ""}`,
-      notes: [`disableModule(prev = SENTINEL, module = ${module})`],
-      via: "safe",
-      category: "revoke",
-      amount: { kind: "none" },
-      build: () =>
-        selfCall(
-          account,
-          encodeFunctionData({ abi: safeAbi, functionName: "disableModule", args: [SENTINEL, module] }),
-        ),
+      note: `disableModule(prev = SENTINEL, module = ${module})`,
+      call: selfCall(
+        account,
+        encodeFunctionData({ abi: safeAbi, functionName: "disableModule", args: [SENTINEL, module] }),
+      ),
     });
   }
   const handler = report.compatibilityFallbackHandler;
   if (!isAddressEqual(report.safe.fallbackHandler, handler)) {
-    steps.push({
+    removals.push({
       id: `set-fallback-handler:${handler}`,
       title: `Reset the fallback handler to the plain CompatibilityFallbackHandler ${handler}`,
-      notes: [`was ${report.safe.fallbackHandler}`],
+      note: `setFallbackHandler(${handler}), was ${report.safe.fallbackHandler}`,
+      call: selfCall(
+        account,
+        encodeFunctionData({ abi: safeAbi, functionName: "setFallbackHandler", args: [handler] }),
+      ),
+    });
+  }
+  const batch = options.batch ?? Boolean(report.multiSendCallOnly);
+  if (batch && removals.length > 1) {
+    const calls = removals.map((r) => r.call);
+    steps.push({
+      id: `revoke-batch:${removals.map((r) => r.id.split(":")[1]).join(",")}`,
+      title: `Revoke every agent and bank power in one transaction (${removals.length} changes)`,
+      notes: [
+        ...removals.map((r) => r.title),
+        "Atomic: a DELEGATECALL to the canonical Safe MultiSendCallOnly (code hash checked), which can only make these CALLs to the account itself. Nothing can act between the removals.",
+      ],
       via: "safe",
       category: "revoke",
+      operation: 1,
       amount: { kind: "none" },
-      build: () =>
-        selfCall(
-          account,
-          encodeFunctionData({ abi: safeAbi, functionName: "setFallbackHandler", args: [handler] }),
-        ),
+      build: () => call(MULTISEND_CALL_ONLY, encodeMultiSend(calls)),
     });
+  } else {
+    for (const r of removals) {
+      steps.push({
+        id: r.id,
+        title: r.title,
+        notes: [r.note],
+        via: "safe",
+        category: "revoke",
+        amount: { kind: "none" },
+        build: () => r.call,
+      });
+    }
   }
   return steps;
 }
@@ -460,6 +491,8 @@ export interface ExitOptions {
   /** Extra ERC-20 tokens to sweep from the account (USDC and position tokens are always included). */
   extraTokens?: readonly Address[];
   signer?: Address;
+  /** See RevokeOptions.batch. */
+  batch?: boolean;
 }
 
 /**
@@ -474,7 +507,12 @@ export function planExit(report: AccountReport, options: ExitOptions): Plan {
   const to = getAddress(options.to);
   const steps: PlanStep[] = [];
   const skipped: string[] = [];
-  steps.push(...planRevoke(report, { keepGuard: options.keepGuard ?? false }));
+  steps.push(
+    ...planRevoke(report, {
+      keepGuard: options.keepGuard ?? false,
+      ...(options.batch !== undefined ? { batch: options.batch } : {}),
+    }),
+  );
   const streams = planCancelStreams(report);
   const escrows = planRefundEscrows(report);
   const vaults = planWithdrawVaults(report, {

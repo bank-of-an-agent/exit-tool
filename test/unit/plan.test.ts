@@ -8,6 +8,7 @@ import {
   timeLockVaultsAbi,
 } from "../../src/core/abis/index";
 import { SAFE7579_ADAPTER, SAFE_V141, SENTINEL, ZERO_ADDRESS } from "../../src/core/constants";
+import { decodeMultiSend, encodeMultiSend, MULTISEND_CALL_ONLY } from "../../src/core/multisend";
 import {
   planCancelStreams,
   planExit,
@@ -73,6 +74,54 @@ describe("planRevoke", () => {
       fallbackHandler: SAFE_V141.compatibilityFallbackHandler,
     };
     expect(planRevoke(clean)).toEqual([]);
+  });
+});
+
+describe("atomic revoke batch", () => {
+  it("removes every module and resets the fallback handler in one MultiSendCallOnly DELEGATECALL", () => {
+    const report = makeReport({ multiSendCallOnly: MULTISEND_CALL_ONLY });
+    const steps = planRevoke(report);
+    // The guard goes first on its own (a guard may veto DELEGATECALLs), then one atomic batch.
+    expect(steps.map((s) => s.id.split(":")[0])).toEqual(["remove-guard", "revoke-batch"]);
+    const batch = steps[1]!;
+    expect(batch.operation).toBe(1);
+    const call = batch.build(0n);
+    expect(call.to).toBe(MULTISEND_CALL_ONLY);
+    const inner = decodeMultiSend(call.data)!;
+    expect(inner.map((c) => [c.to, decodeFunctionData({ abi: safeAbi, data: c.data }).functionName])).toEqual(
+      [
+        [ACCOUNT, "disableModule"],
+        [ACCOUNT, "disableModule"],
+        [ACCOUNT, "setFallbackHandler"],
+      ],
+    );
+    expect(planRevoke(report, { batch: false }).map((s) => s.operation ?? 0)).toEqual([0, 0, 0, 0]);
+  });
+
+  it("does not batch a single change", () => {
+    const report = makeReport({ multiSendCallOnly: MULTISEND_CALL_ONLY });
+    report.safe = {
+      ...report.safe,
+      modules: [OTHER],
+      guard: ZERO_ADDRESS,
+      fallbackHandler: SAFE_V141.compatibilityFallbackHandler,
+    };
+    expect(planRevoke(report).map((s) => [s.id.split(":")[0], s.operation ?? 0])).toEqual([
+      ["disable-module", 0],
+    ]);
+  });
+
+  it("round-trips MultiSend encoding and rejects DELEGATECALLs inside a batch", () => {
+    const calls = [
+      { to: ACCOUNT, value: 0n, data: "0x1234" as const },
+      { to: USDC, value: 5n, data: "0x" as const },
+    ];
+    expect(decodeMultiSend(encodeMultiSend(calls))).toEqual(calls);
+    // Flip the first operation byte of the packed payload to 1 (DELEGATECALL).
+    const data = encodeMultiSend(calls);
+    const packedStart = 2 + 8 + 64 + 64; // selector, offset word, length word
+    const tampered = `${data.slice(0, packedStart)}01${data.slice(packedStart + 2)}` as `0x${string}`;
+    expect(decodeMultiSend(tampered)).toBeUndefined();
   });
 });
 

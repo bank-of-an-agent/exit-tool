@@ -1,5 +1,6 @@
 import { decodeFunctionData, formatEther, type Abi, type Address, type Hex } from "viem";
 import { agentEscrowAbi, erc20Abi, paymentStreamsAbi, safeAbi, timeLockVaultsAbi } from "./abis/index";
+import { decodeMultiSend, MULTISEND_CALL_ONLY } from "./multisend";
 import type { Call } from "./safe";
 
 const CALL_ABI = [
@@ -21,6 +22,10 @@ function formatArg(value: unknown): string {
 /** `transfer(0xabc…, 1000000)`-style description of a call, or the raw selector when unknown. */
 export function describeCall(call: Call): string {
   if (call.data === "0x") return call.value > 0n ? `send ${formatEther(call.value)} ETH` : "empty call";
+  if (call.to.toLowerCase() === MULTISEND_CALL_ONLY.toLowerCase()) {
+    const inner = decodeMultiSend(call.data);
+    if (inner) return `multiSend[${inner.map((c) => `${c.to}.${describeCall(c)}`).join("; ")}]`;
+  }
   try {
     const decoded = decodeFunctionData({ abi: CALL_ABI, data: call.data });
     const args = (decoded.args ?? []).map(formatArg).join(", ");

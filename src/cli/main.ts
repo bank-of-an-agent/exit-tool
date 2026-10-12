@@ -40,7 +40,7 @@ import {
 } from "../core/plan";
 import { buildPlanFile, parsePlanFile, type PlanFile } from "../core/planfile";
 import { readTokenInfo } from "../core/positions";
-import { describeRevertData } from "../core/revert";
+import { describeError, describeRevertData } from "../core/revert";
 import {
   encodeExecTransaction,
   normalizeEcdsaSignature,
@@ -97,7 +97,9 @@ function reportError(err: unknown, printer: Printer): number {
     }
     return err.code === "invalid_argument" ? 2 : 1;
   }
-  const message = err instanceof Error ? err.message : String(err);
+  // Library errors (viem) can embed request details such as the RPC URL, which may carry an API
+  // key: print the short, decoded form only.
+  const message = describeError(err);
   if (printer.isJson) printer.document({ error: { code: "internal_error", message } });
   else printer.info(`error: ${message}`);
   return 1;

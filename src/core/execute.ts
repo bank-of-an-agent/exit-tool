@@ -288,7 +288,7 @@ export async function executePlan(
         abi: safeAbi,
         functionName: "nonce",
       });
-      const tx = safeTxForCall(call, nonce);
+      const tx = safeTxForCall(call, nonce, step.operation ?? 0);
       const signatures = await collectSafeSignatures(tx, options);
       prepared = {
         to: options.account,
