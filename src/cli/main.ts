@@ -16,7 +16,6 @@ import { safeAbi, timeLockVaultsAbi } from "../core/abis/index";
 import { parseAmount } from "../core/amounts";
 import { txUrl, type ChainConfig } from "../core/chains";
 import { SAFE7579_ADAPTER, SIMULATION_SENDER, ZERO_ADDRESS } from "../core/constants";
-import { formatTimestamp } from "../core/describe";
 import type { Deployments } from "../core/deployments";
 import { ExitToolError } from "../core/errors";
 import {
@@ -211,8 +210,9 @@ async function runCommand(command: Exclude<Command, "submit" | "help">, ctx: Con
     if (report.safe.deployed) {
       printer.line("");
       printer.line(
-        `Next: agentbank-exit exit --account ${account} --to <your address>   (dry run; add --execute to send)`,
+        `Next: agentbank-exit exit --account ${account} --to <your address> [same connection options]`,
       );
+      printer.line("      That is a dry run: it prints and simulates every step. Add --execute to send.");
     }
     printer.document({ command, report, recovery: summary });
     return 0;
@@ -289,18 +289,15 @@ async function runCommand(command: Exclude<Command, "submit" | "help">, ctx: Con
       ...(payer ? { payer } : {}),
     }).join("\n"),
   );
-  if (plan.skipped.length > 0) {
+  const pending = summary.pending;
+  if (command === "exit") {
+    if (pending.length > 0) {
+      printer.line("Not recoverable yet (run exit again once these become available):");
+      for (const p of pending) printer.line(`  - ${tokenAmount(report, p.token, p.amount)}: ${p.label}`);
+    }
+  } else if (plan.skipped.length > 0) {
     printer.line("Left alone:");
     for (const s of plan.skipped) printer.line(`  - ${s}`);
-  }
-  const pending = summary.pending;
-  if (command === "exit" && pending.length > 0) {
-    printer.line("Not recoverable yet (run the tool again later):");
-    for (const p of pending) {
-      printer.line(
-        `  - ${tokenAmount(report, p.token, p.amount)}: ${p.label}${p.availableAt ? ` (${formatTimestamp(p.availableAt)})` : ""}`,
-      );
-    }
   }
 
   const baseDoc = {
@@ -667,10 +664,9 @@ async function finalState(ctx: Context, account: Address, signer: Address | unde
   );
   if (summary.pending.length > 0) {
     ctx.printer.line("  still pending:");
-    for (const p of summary.pending)
-      ctx.printer.line(
-        `    - ${tokenAmount(report, p.token, p.amount)}: ${p.label}${p.availableAt ? ` (${formatTimestamp(p.availableAt)})` : ""}`,
-      );
+    for (const p of summary.pending) {
+      ctx.printer.line(`    - ${tokenAmount(report, p.token, p.amount)}: ${p.label}`);
+    }
   }
   return { safe: report.safe, eth: report.eth, balances: report.balances, recovery: summary };
 }
@@ -821,6 +817,29 @@ async function runSubmit(ctx: Context): Promise<number> {
   const account = parseAddressOption("account", values.account ?? ctx.io.env.AGENTBANK_ACCOUNT);
   const { file, steps } = parsePlanFile(json, { chainId: conn.chain.id, ...(account ? { account } : {}) });
   const signatures = (values.signature ?? []) as Hex[];
+  const safeNonce = await conn.client.readContract({
+    address: file.account,
+    abi: safeAbi,
+    functionName: "nonce",
+  });
+  // Safe steps whose nonce is already used ran before (or were replaced): never resend them.
+  const done = steps.filter((s) => !s.skipped && s.safeTx !== undefined && s.safeTx.nonce < safeNonce);
+  for (const s of done) {
+    s.skipped = `already executed or replaced (Safe nonce ${s.safeTx!.nonce} is used)`;
+  }
+  if (steps.every((s) => s.skipped)) {
+    printer.line(
+      `Nothing left to submit from ${planPath}: every step has already run (Safe nonce is ${safeNonce}).`,
+    );
+    printer.document({
+      command: "submit",
+      planFile: planPath,
+      account: file.account,
+      execution: [],
+      alreadyExecuted: done.map((s) => s.index),
+    });
+    return 0;
+  }
   const finals = await finalizeSignedSteps(steps, file, signatures);
 
   // Simulate exactly what will be sent, with the real signatures.
@@ -843,13 +862,12 @@ async function runSubmit(ctx: Context): Promise<number> {
     results,
     gasTotal: results.reduce((a, r) => a + r.gasUsed, 0n),
   };
-  const safe = await conn.client.readContract({ address: file.account, abi: safeAbi, functionName: "nonce" });
   const reportStub = await inspect(ctx, file.account, undefined, false);
   printer.line(
     renderSimulation(
       reportStub,
       sim,
-      `Signed plan ${planPath}: ${file.command} for ${file.account} on ${conn.chain.label} (Safe nonce now ${safe})`,
+      `Signed plan ${planPath}: ${file.command} for ${file.account} on ${conn.chain.label} (Safe nonce now ${safeNonce})`,
     ).join("\n"),
   );
   for (const note of file.notes) printer.line(`  note: ${note}`);

@@ -1,6 +1,7 @@
 import { encodeFunctionData, getAddress, isAddressEqual, type Address, type Hex } from "viem";
 import { agentEscrowAbi, erc20Abi, paymentStreamsAbi, safeAbi, timeLockVaultsAbi } from "./abis/index";
 import { SENTINEL, ZERO_ADDRESS } from "./constants";
+import { formatTimestamp } from "./describe";
 import { ExitToolError } from "./errors";
 import type { AccountReport } from "./inspect";
 import type { Call } from "./safe";
@@ -219,7 +220,7 @@ export function planRefundEscrows(
     if (e.status !== "Active" && e.status !== "Disputed") continue;
     if (!e.refundableNow) {
       skipped.push(
-        `escrow #${e.id}: ${e.status === "Disputed" ? "disputed" : "not expired"}; refundable from unix time ${e.refundableAt}`,
+        `escrow #${e.id}: ${e.status === "Disputed" ? "disputed" : "not expired"}; refundable from ${formatTimestamp(e.refundableAt)}`,
       );
       continue;
     }
@@ -375,12 +376,12 @@ export function planWithdrawVaults(
       continue;
     }
     if (options.unlockedOnly) {
-      skipped.push(`vault #${v.id}: locked until unix time ${v.unlockAt} (--unlocked-only)`);
+      skipped.push(`vault #${v.id}: locked until ${formatTimestamp(v.unlockAt)} (--unlocked-only)`);
       continue;
     }
     if (!isSigner(v.owner)) {
       skipped.push(
-        `vault #${v.id}: locked until unix time ${v.unlockAt}; only its owner ${v.owner} can sign an early withdrawal`,
+        `vault #${v.id}: locked until ${formatTimestamp(v.unlockAt)}; only its owner ${v.owner} can sign an early withdrawal`,
       );
       continue;
     }
@@ -389,7 +390,7 @@ export function planWithdrawVaults(
       title: `Early-withdraw locked vault #${v.id} to the account (owner-signed)`,
       notes: [
         `TimeLockVaults.withdrawWithSignature(${v.id}, balance, deadline, sig): the vault owner signs an EIP-712 EarlyWithdrawal; funds only go to the account.`,
-        `The vault was locked until unix time ${v.unlockAt}.`,
+        `The vault was locked until ${formatTimestamp(v.unlockAt)}.`,
       ],
       via: "direct",
       category: "recover",

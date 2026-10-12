@@ -201,6 +201,20 @@ export async function inspectAccount(client: PublicClient, options: InspectOptio
   const labels = knownLabels(options);
   const signer = options.signer ? getAddress(options.signer) : undefined;
 
+  // Only trust configured Agent Bank contracts that exist on this chain (a dry-run deployments file,
+  // or one for another network, would otherwise produce confusing errors).
+  const contracts: AgentBankContracts = {};
+  const missing: string[] = [];
+  for (const [key, address] of Object.entries(options.contracts) as [
+    keyof AgentBankContracts,
+    Address | undefined,
+  ][]) {
+    if (!address) continue;
+    const code = await client.getCode({ address });
+    if (code && code !== "0x") contracts[key] = address;
+    else missing.push(`${key} ${address}`);
+  }
+
   const report: AccountReport = {
     chain: { id: options.chain.id, name: options.chain.name, label: options.chain.label },
     block,
@@ -209,10 +223,8 @@ export async function inspectAccount(client: PublicClient, options: InspectOptio
     eth: await client.getBalance({ address: account, blockNumber: block.number }),
     tokens: {},
     balances: {},
-    agentBankConfigured: Boolean(
-      options.contracts.escrow || options.contracts.streams || options.contracts.vaults,
-    ),
-    contracts: options.contracts,
+    agentBankConfigured: Boolean(contracts.escrow || contracts.streams || contracts.vaults),
+    contracts,
     escrows: [],
     streams: [],
     vaults: [],
@@ -224,6 +236,13 @@ export async function inspectAccount(client: PublicClient, options: InspectOptio
   if (signer)
     report.signer = { address: signer, isOwner: safe.owners.some((o) => isAddressEqual(o, signer)) };
 
+  if (missing.length > 0) {
+    report.findings.push({
+      severity: "warning",
+      code: "contracts_missing",
+      message: `Configured Agent Bank contracts have no code on ${options.chain.label} and were ignored: ${missing.join(", ")} (wrong or dry-run deployments file?).`,
+    });
+  }
   if (!safe.deployed) {
     report.findings.push({
       severity: "danger",
@@ -263,7 +282,7 @@ export async function inspectAccount(client: PublicClient, options: InspectOptio
   const scanFromBlock = accountDeployedAt ?? lo;
   const maxLogRequests = options.discovery?.maxLogRequests ?? 500;
 
-  const positions = await discoverPositionIds(client, account, options.contracts, {
+  const positions = await discoverPositionIds(client, account, contracts, {
     mode: options.discovery?.mode ?? "auto",
     fromBlock: scanFromBlock,
     toBlock: block.number,
@@ -272,20 +291,14 @@ export async function inspectAccount(client: PublicClient, options: InspectOptio
   report.discovery = { positions, scanFromBlock };
   if (accountDeployedAt !== undefined) report.discovery.accountDeployedAt = accountDeployedAt;
 
-  if (options.contracts.escrow && positions.escrows.length > 0) {
-    report.escrows = await readEscrows(
-      client,
-      options.contracts.escrow,
-      positions.escrows,
-      account,
-      block.timestamp,
-    );
+  if (contracts.escrow && positions.escrows.length > 0) {
+    report.escrows = await readEscrows(client, contracts.escrow, positions.escrows, account, block.timestamp);
   }
-  if (options.contracts.streams && positions.streams.length > 0) {
-    report.streams = await readStreams(client, options.contracts.streams, positions.streams, account);
+  if (contracts.streams && positions.streams.length > 0) {
+    report.streams = await readStreams(client, contracts.streams, positions.streams, account);
   }
-  if (options.contracts.vaults && positions.vaults.length > 0) {
-    report.vaults = await readVaults(client, options.contracts.vaults, positions.vaults, block.timestamp);
+  if (contracts.vaults && positions.vaults.length > 0) {
+    report.vaults = await readVaults(client, contracts.vaults, positions.vaults, block.timestamp);
   }
 
   if (options.usdc) {

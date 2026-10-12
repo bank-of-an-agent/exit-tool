@@ -57,7 +57,9 @@ export async function connect(values: Values, io: Io): Promise<Connection> {
     nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
     rpcUrls: { default: { http: [rpcUrl] } },
   });
-  const client = createPublicClient({ chain: viemChain, transport }) as PublicClient;
+  // Anvil mines instantly; Base Sepolia makes a block every 2 seconds.
+  const pollingInterval = chain.name === "anvil" ? 100 : 1_000;
+  const client = createPublicClient({ chain: viemChain, transport, pollingInterval }) as PublicClient;
   return { client, chain, viemChain, rpcUrl };
 }
 

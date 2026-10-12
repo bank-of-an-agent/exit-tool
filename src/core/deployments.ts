@@ -19,6 +19,8 @@ export interface Deployments {
   contracts: AgentBankContracts;
   /** Earliest block of any Agent Bank contract: event scans never need to look further back. */
   fromBlock?: bigint;
+  /** `dry-run` when the file records a simulated deployment (the addresses may hold no code). */
+  mode?: string;
 }
 
 const KEYS: Record<string, keyof AgentBankContracts | "usdc" | "compatibilityFallbackHandler"> = {
@@ -81,7 +83,9 @@ export function parseDeployments(json: unknown): Deployments {
     if (block !== undefined) blocks.push(block);
   }
 
-  const containers = [root, root.contracts, root.addresses, root.deployments].filter(
+  if (typeof root.mode === "string") out.mode = root.mode;
+  // The contracts repo's Deploy.s.sol writes { chainId, contracts: {…}, dependencies: { USDC, … } }.
+  const containers = [root, root.contracts, root.addresses, root.deployments, root.dependencies].filter(
     (c): c is Record<string, unknown> => c !== null && typeof c === "object" && !Array.isArray(c),
   );
   for (const container of containers) {
@@ -121,6 +125,7 @@ export function mergeDeployments(...items: (Deployments | undefined)[]): Deploym
       out.compatibilityFallbackHandler = item.compatibilityFallbackHandler;
     }
     if (item.fromBlock !== undefined) out.fromBlock = item.fromBlock;
+    if (item.mode !== undefined) out.mode = item.mode;
     for (const [k, v] of Object.entries(item.contracts) as [
       keyof AgentBankContracts,
       Address | undefined,

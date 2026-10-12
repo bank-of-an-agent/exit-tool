@@ -1,4 +1,5 @@
 import { isAddressEqual, type Address } from "viem";
+import { formatTimestamp } from "./describe";
 import type { AccountReport } from "./inspect";
 
 /** Value the owner can bring back to their destination now. */
@@ -83,7 +84,7 @@ export function summarizeRecovery(report: AccountReport): RecoverySummary {
           kind: "escrow_disputed",
           token: e.token,
           amount: e.amount,
-          label: `escrow #${e.id} is disputed: the arbiter decides; if it stays silent, anyone can refund you from the available date`,
+          label: `escrow #${e.id} is disputed: the arbiter decides; if it stays silent, anyone can refund you from ${formatTimestamp(e.refundableAt)}`,
           availableAt: e.refundableAt,
         });
       } else {
@@ -91,7 +92,7 @@ export function summarizeRecovery(report: AccountReport): RecoverySummary {
           kind: "escrow_locked",
           token: e.token,
           amount: e.amount,
-          label: `escrow #${e.id} to ${e.payee} has not expired: refundable from the available date (or earlier if the payee refunds)`,
+          label: `escrow #${e.id} to ${e.payee} has not expired: refundable from ${formatTimestamp(e.refundableAt)} (or earlier if the payee refunds)`,
           availableAt: e.refundableAt,
         });
       }
@@ -166,7 +167,7 @@ export function summarizeRecovery(report: AccountReport): RecoverySummary {
         kind: "vault_locked",
         token: v.token,
         amount: v.balance,
-        label: `vault #${v.id} is locked and owned by ${v.owner}; it unlocks on the available date`,
+        label: `vault #${v.id} is locked until ${formatTimestamp(v.unlockAt)} and owned by ${v.owner}: after that anyone can return it to the account`,
         availableAt: v.unlockAt,
       });
     }

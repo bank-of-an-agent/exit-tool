@@ -111,7 +111,7 @@ export const safeAbi = [
     type: "event",
     name: "ExecutionSuccess",
     inputs: [
-      { name: "txHash", type: "bytes32", indexed: false },
+      { name: "txHash", type: "bytes32", indexed: true },
       { name: "payment", type: "uint256", indexed: false },
     ],
   },
@@ -119,7 +119,7 @@ export const safeAbi = [
     type: "event",
     name: "ExecutionFailure",
     inputs: [
-      { name: "txHash", type: "bytes32", indexed: false },
+      { name: "txHash", type: "bytes32", indexed: true },
       { name: "payment", type: "uint256", indexed: false },
     ],
   },
@@ -127,9 +127,9 @@ export const safeAbi = [
   {
     type: "event",
     name: "ChangedFallbackHandler",
-    inputs: [{ name: "handler", type: "address", indexed: false }],
+    inputs: [{ name: "handler", type: "address", indexed: true }],
   },
-  { type: "event", name: "ChangedGuard", inputs: [{ name: "guard", type: "address", indexed: false }] },
+  { type: "event", name: "ChangedGuard", inputs: [{ name: "guard", type: "address", indexed: true }] },
 ] as const;
 
 /** Human explanations of Safe v1.4.1 `GSxxx` revert codes. */

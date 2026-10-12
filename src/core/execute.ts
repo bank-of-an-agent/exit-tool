@@ -220,7 +220,9 @@ async function broadcast(
     const failure = events.find((e) => e.eventName === "ExecutionFailure");
     const success = events.find(
       (e) =>
-        e.eventName === "ExecutionSuccess" && (e.args as { txHash?: Hex }).txHash === prepared.safeTxHash,
+        e.eventName === "ExecutionSuccess" &&
+        (e.args as { txHash?: Hex } | undefined)?.txHash?.toLowerCase() ===
+          prepared.safeTxHash!.toLowerCase(),
     );
     if (failure || !success) {
       throw new ExitToolError(

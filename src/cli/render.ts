@@ -134,9 +134,7 @@ export function renderReport(report: AccountReport, summary: RecoverySummary, ch
     out.push("");
     out.push("Not recoverable yet");
     for (const item of summary.pending) {
-      out.push(
-        `  • ${tokenAmount(report, item.token, item.amount)}: ${item.label}${item.availableAt ? ` (${formatTimestamp(item.availableAt)})` : ""}`,
-      );
+      out.push(`  • ${tokenAmount(report, item.token, item.amount)}: ${item.label}`);
     }
   }
   return out;
@@ -165,17 +163,21 @@ export function renderSimulation(
     if (step.amount !== undefined && step.moves) {
       out.push(`    amount: ${tokenAmount(report, step.moves.token, step.amount)}`);
     }
-    if (!step.skipped) {
+    if (!step.skipped && step.vault) {
+      const m = step.vault.message;
+      out.push(
+        `    call: ${step.call.to}.withdrawWithSignature(${m.vaultId}, ${m.amount}, ${m.deadline}, <EIP-712 signature of ${step.vault.owner}>)`,
+      );
+      out.push(
+        `    EarlyWithdrawal nonce ${m.nonce}, deadline ${formatTimestamp(m.deadline)}, digest ${step.vault.digest}`,
+      );
+    } else if (!step.skipped) {
       out.push(`    call: ${step.call.to}.${describeCall(step.call)}`);
       out.push(
         `    calldata: ${step.call.data}${step.call.value > 0n ? `  value: ${step.call.value} wei` : ""}`,
       );
       if (step.safeTx && step.safeTxHash)
         out.push(`    SafeTx nonce ${step.safeTx.nonce}, hash ${step.safeTxHash}`);
-      if (step.vault)
-        out.push(
-          `    EarlyWithdrawal nonce ${step.vault.message.nonce}, deadline ${formatTimestamp(step.vault.message.deadline)}, digest ${step.vault.digest}`,
-        );
     }
     for (const note of step.notes) out.push(`    · ${note}`);
   }
