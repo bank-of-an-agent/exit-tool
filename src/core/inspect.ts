@@ -1,5 +1,6 @@
 import { getAddress, isAddressEqual, type Address, type PublicClient } from "viem";
-import { erc20Abi } from "./abis/index";
+import { agentPolicyHookAbi, erc20Abi, sweepExecutorAbi, topUpExecutorAbi } from "./abis/index";
+import { formatAmount } from "./amounts";
 import type { ChainConfig } from "./chains";
 import { SAFE7579_ADAPTER, SAFE_V141, ZERO_ADDRESS } from "./constants";
 import type { AgentBankContracts } from "./deployments";
@@ -85,6 +86,8 @@ export interface AccountReport {
   compatibilityFallbackHandler: Address;
   /** The canonical MultiSendCallOnly, when its code was verified on this chain (enables the atomic revoke). */
   multiSendCallOnly?: Address;
+  /** Treasury-sweep fund shares held by the account (SweepExecutor configuration), if any. */
+  fundShares?: { fund: TokenInfo; balance: bigint };
 }
 
 const KNOWN_SINGLETONS: Record<string, string> = {
@@ -275,6 +278,8 @@ export async function inspectAccount(client: PublicClient, options: InspectOptio
     report.usdc = report.tokens[options.usdc.toLowerCase()];
   }
 
+  if (safe.deployed) await executorFindings(client, report, contracts, block.number);
+
   if (options.positions === false || !safe.deployed) return report;
 
   // Positions can only exist after the account existed: start event scans there.
@@ -345,6 +350,73 @@ export async function inspectAccount(client: PublicClient, options: InspectOptio
     });
   }
   return report;
+}
+
+/**
+ * What Agent Bank's ERC-7579 executors and hook may still do through the Safe7579 adapter (they all
+ * stop working once the adapter is disabled), and treasury-sweep fund shares the account holds.
+ */
+async function executorFindings(
+  client: PublicClient,
+  report: AccountReport,
+  contracts: AgentBankContracts,
+  blockNumber: bigint,
+): Promise<void> {
+  const account = report.account;
+  const initialized = async (
+    address: Address | undefined,
+    abi: typeof topUpExecutorAbi | typeof sweepExecutorAbi | typeof agentPolicyHookAbi,
+  ) =>
+    address
+      ? ((await client
+          .readContract({
+            address,
+            abi: abi as typeof topUpExecutorAbi,
+            functionName: "isInitialized",
+            args: [account],
+            blockNumber,
+          })
+          .catch(() => false)) as boolean)
+      : false;
+  if (await initialized(contracts.topUpExecutor, topUpExecutorAbi)) {
+    report.findings.push({
+      severity: "warning",
+      code: "topup_executor",
+      message:
+        "The TopUpExecutor is installed: keepers can move funds from this account to its agent accounts (within its daily caps) until the Safe7579 adapter is disabled.",
+    });
+  }
+  if (await initialized(contracts.policyHook, agentPolicyHookAbi)) {
+    report.findings.push({
+      severity: "info",
+      code: "policy_hook",
+      message:
+        "The AgentPolicyHook limits agent operations; it never applies to the owner's execTransaction path.",
+    });
+  }
+  if (contracts.sweepExecutor && (await initialized(contracts.sweepExecutor, sweepExecutorAbi))) {
+    const config = await client.readContract({
+      address: contracts.sweepExecutor,
+      abi: sweepExecutorAbi,
+      functionName: "getConfig",
+      args: [account],
+      blockNumber,
+    });
+    const fund = await readTokenInfo(client, config.fund);
+    const balance = await client.readContract({
+      address: config.fund,
+      abi: erc20Abi,
+      functionName: "balanceOf",
+      args: [account],
+      blockNumber,
+    });
+    report.fundShares = { fund, balance };
+    report.findings.push({
+      severity: "warning",
+      code: "sweep_executor",
+      message: `The SweepExecutor is installed (fund ${config.fund}): keepers can move USDC into that fund until the Safe7579 adapter is disabled. The account holds ${formatAmount(balance, fund.decimals)} ${fund.symbol} fund shares; exit leaves them in place unless you add --extra-token ${config.fund} (or redeem them with the fund).`,
+    });
+  }
 }
 
 /** Throws a clear error when the account cannot be operated by the given signer. */

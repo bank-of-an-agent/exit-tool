@@ -8,6 +8,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
+  encodeAbiParameters,
   encodeFunctionData,
   getAddress,
   keccak256,
@@ -39,6 +40,11 @@ export const escrowArt = agentBankArtifact("AgentEscrow");
 export const streamsArt = agentBankArtifact("PaymentStreams");
 export const vaultsArt = agentBankArtifact("TimeLockVaults");
 export const usdcArt = agentBankArtifact("MockUSDC");
+export const topUpArt = agentBankArtifact("TopUpExecutor");
+export const sweepArt = agentBankArtifact("SweepExecutor");
+export const fundArt = agentBankArtifact("MockTreasuryFund");
+/** Treasury executors and the mock fund are optional parts of the scenario. */
+export const haveExecutors = Boolean(topUpArt && sweepArt && fundArt);
 /** Whether ../contracts/out (or $AGENTBANK_CONTRACTS_OUT) has the Agent Bank artifacts the drill needs. */
 export const haveAgentBank = Boolean(escrowArt && streamsArt && vaultsArt && usdcArt);
 
@@ -58,6 +64,8 @@ export interface Drill {
   dir: string;
   deploymentsFile: string;
   ab?: {
+    /** Treasury executors installed on the account, and the sweep fund whose shares it holds. */
+    executors?: { topUp: Address; sweep: Address; fund: Address; fundAbi: Abi; shares: bigint };
     escrow: Address;
     streams: Address;
     vaults: Address;
@@ -177,13 +185,23 @@ export async function setupDrill(options: { anvilArgs?: string[]; port?: number 
   const escrow = await deploy(c, "deployer", escrowArt!, [guardian, ZERO_ADDRESS]);
   const streams = await deploy(c, "deployer", streamsArt!, [guardian]);
   const vaults = await deploy(c, "deployer", vaultsArt!, [guardian]);
+  const topUp = haveExecutors ? await deploy(c, "deployer", topUpArt!) : undefined;
+  const sweep = haveExecutors ? await deploy(c, "deployer", sweepArt!) : undefined;
+  const fund = haveExecutors
+    ? await deploy(c, "deployer", fundArt!, [token, accounts.deployer.address])
+    : undefined;
   writeFileSync(
     deploymentsFile,
     JSON.stringify(
       {
         chainId: 31337,
-        contracts: { AgentEscrow: escrow, PaymentStreams: streams, TimeLockVaults: vaults },
-        dependencies: { USDC: token },
+        contracts: {
+          AgentEscrow: escrow,
+          PaymentStreams: streams,
+          TimeLockVaults: vaults,
+          ...(topUp && sweep ? { TopUpExecutor: topUp, SweepExecutor: sweep } : {}),
+        },
+        dependencies: { USDC: token, ...(fund ? { MockTreasuryFund: fund } : {}) },
         mode: "broadcast",
       },
       null,
@@ -257,7 +275,36 @@ export async function setupDrill(options: { anvilArgs?: string[]; port?: number 
   await send(c, "spendKey", token, call(usdcAbi, "approve", [safe, maxUint256]));
   await send(c, "deployer", token, call(usdcAbi, "mint", [accounts.spendKey2.address, u(5)]));
 
+  // Treasury automation, installed the way the Safe7579 adapter installs executors (the account calls
+  // onInstall): an auto top-up rule set and a treasury sweep into a tokenized fund, with fund shares.
+  let executors: NonNullable<Drill["ab"]>["executors"];
+  if (topUp && sweep && fund) {
+    await agent(topUp, call(topUpArt!.abi, "onInstall", ["0x"]));
+    const sweepConfig = encodeAbiParameters(
+      [
+        {
+          type: "tuple",
+          components: [
+            { name: "fund", type: "address" },
+            { name: "asset", type: "address" },
+            { name: "maxSavingsBps", type: "uint16" },
+            { name: "liquidFloor", type: "uint256" },
+            { name: "sweepThreshold", type: "uint256" },
+          ],
+        },
+      ],
+      [{ fund, asset: token, maxSavingsBps: 5_000, liquidFloor: u(1_000), sweepThreshold: u(100) }],
+    );
+    await agent(sweep, call(sweepArt!.abi, "onInstall", [sweepConfig]));
+    await send(c, "deployer", token, call(usdcAbi, "mint", [safe, u(60)]));
+    await agent(token, call(usdcAbi, "approve", [fund, u(60)]));
+    await agent(fund, call(fundArt!.abi, "deposit", [u(60), safe]));
+    const shares = await read<bigint>(result, fund, fundArt!.abi, "balanceOf", [safe]);
+    executors = { topUp, sweep, fund, fundAbi: fundArt!.abi, shares };
+  }
+
   result.ab = {
+    ...(executors ? { executors } : {}),
     escrow,
     streams,
     vaults,

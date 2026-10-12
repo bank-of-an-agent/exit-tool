@@ -171,6 +171,15 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
     expect(discovery.positions.method).toBe("events");
     expect(origins(run.urls)).toEqual([new URL(drill.anvil.rpcUrl).origin]);
 
+    const executors = drill.ab!.executors;
+    if (executors) {
+      // Treasury automation is reported (and goes away with the adapter); fund shares are found.
+      const codes = (report.findings as { code: string }[]).map((f) => f.code);
+      expect(codes).toEqual(expect.arrayContaining(["topup_executor", "sweep_executor"]));
+      const fundShares = report.fundShares as { fund: { address: string }; balance: string };
+      expect(getAddress(fundShares.fund.address)).toBe(executors.fund);
+      expect(fundShares.balance).toBe(String(executors.shares));
+    }
     const recovery = run.json!.recovery as { now: { kind: string }[]; pending: { kind: string }[] };
     expect(recovery.now.map((r) => r.kind).sort()).toEqual(
       [
@@ -207,7 +216,8 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
     expect(er.discovery.positions.method).toBe("enumeration");
     expect([er.escrows.length, er.streams.length, er.vaults.length]).toEqual([4, 3, 3]);
     summary.push(
-      `inspect: 4 escrows, 3 streams, 3 vaults, 2 spend keys found from events and by enumeration; only ${drill.anvil.rpcUrl} contacted`,
+      `inspect: 4 escrows, 3 streams, 3 vaults, 2 spend keys found from events and by enumeration; only ${drill.anvil.rpcUrl} contacted` +
+        (executors ? "; TopUpExecutor and SweepExecutor installs reported, treasury-fund shares found" : ""),
     );
   });
 
@@ -307,7 +317,9 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
 
   it("exit --execute returns every recoverable unit to the destination", async () => {
     const ab = drill.ab;
-    const execArgs = ["exit", ...cliBase(), "--to", DESTINATION, "--execute", "--yes"];
+    // Fund shares from the treasury sweep are transferable tokens: include them explicitly.
+    const fundArgs = ab?.executors ? ["--extra-token", ab.executors.fund] : [];
+    const execArgs = ["exit", ...cliBase(), "--to", DESTINATION, ...fundArgs, "--execute", "--yes"];
     const run = await runCli([...execArgs, "--json"], ownerEnv);
     transcript("03-exit-execute", run, execArgs);
     expect(run.code, run.stderr + run.stdout).toBe(0);
@@ -387,10 +399,15 @@ describe.skipIf(!anvilAvailable)("shutdown drill on Anvil", () => {
     expect(await read<bigint>(drill.usdc, drill.usdcAbi, "balanceOf", [accounts.spendKey.address])).toBe(0n);
     expect(await balanceOf(ab.escrow)).toBe(usdc(75));
     expect(await balanceOf(ab.vaults)).toBe(usdc(40));
+    if (ab.executors) {
+      const { fund, fundAbi, shares } = ab.executors;
+      expect(await read<bigint>(fund, fundAbi, "balanceOf", [DESTINATION])).toBe(shares);
+      expect(await read<bigint>(fund, fundAbi, "balanceOf", [drill.safe])).toBe(0n);
+    }
 
     summary.push(
       `exit phase 1: ${executed.filter((e) => e.status === "confirmed").length} transactions; destination received ` +
-        `${Number(expected / 10n ** BigInt(drill.decimals - 2)) / 100} USDC + 2 ETH; account left with 0; modules, guard and 7579 fallback removed; ` +
+        `${Number(expected / 10n ** BigInt(drill.decimals - 2)) / 100} USDC + 2 ETH${ab.executors ? " + all treasury-fund shares (--extra-token)" : ""}; account left with 0; modules, guard and 7579 fallback removed; ` +
         `bank module can no longer move funds; pending: escrow B (day 30), disputed escrow C (expiry + 30 d), vault 3 (day 20), spend key 2 (no allowance)`,
     );
   });
