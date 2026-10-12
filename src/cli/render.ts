@@ -65,10 +65,16 @@ export function renderReport(report: AccountReport, summary: RecoverySummary, ch
 
   out.push("");
   if (!report.agentBankConfigured) {
-    out.push(
-      "Agent Bank positions: not checked (no AgentEscrow/PaymentStreams/TimeLockVaults addresses configured;",
-    );
-    out.push("  pass --deployments <file> or --escrow/--streams/--vaults).");
+    if (report.findings.some((f) => f.code === "contracts_missing")) {
+      out.push(
+        "Agent Bank positions: not checked (the configured contracts have no code on this chain; see Findings).",
+      );
+    } else {
+      out.push(
+        "Agent Bank positions: not checked (no AgentEscrow/PaymentStreams/TimeLockVaults addresses configured;",
+      );
+      out.push("  pass --deployments <file> or --escrow/--streams/--vaults).");
+    }
   } else if (report.discovery) {
     const d = report.discovery.positions;
     const how =
